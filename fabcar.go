@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,6 +86,19 @@ type SmartContract struct {
 }
 
 type Participant struct {
+	// Privacy-first canonical fields (preferred for new consumers).
+	CustomerRef     string           `json:"customer_ref,omitempty"`
+	KycRef          string           `json:"kyc_ref,omitempty"`
+	TokenID         string           `json:"token_id"`
+	BIC             string           `json:"bic,omitempty"`
+	Balance         int              `json:"balance"`
+	ForeignBalances map[string]int64 `json:"foreign_balances,omitempty"`
+	Status          string           `json:"status,omitempty"` // ACTIVE/SUSPENDED/PENDING
+	ActivatedAt     string           `json:"activated_at,omitempty"`
+	LastUpdated     string           `json:"last_updated,omitempty"`
+	TransferRefs    []string         `json:"transfer_refs,omitempty"`
+
+	// Legacy fields kept for backward compatibility.
 	CustomerID        string             `json:"customer_id"`
 	Name              string             `json:"name"`
 	NetworkAddress    string             `json:"network_address"`
@@ -91,34 +107,43 @@ type Participant struct {
 	Approved          bool               `json:"approved"`
 	ApprovedAt        string             `json:"approved_at"`
 	Country           string             `json:"country"`
-	TokenID           string             `json:"token_id"`
 	TransferIDs       []string           `json:"transfer_ids"`
 	KycId             string             `json:"kyc_id"`
 	KycStatus         string             `json:"kyc_status"`
-	Balance           int                `json:"balance"`
 	ForeignCurrencies map[string]float64 `json:"foreign_currencies"` // Holdings in other currencies
 	TokenTransferIDs  []string           `json:"token_transfer_ids"`
 }
 
 type Token struct {
-	TokenID         string         `json:"token_id"`
+	TokenID     string `json:"token_id"`     // Unique asset identifier
+	BIC         string `json:"bic"`          // SWIFT/ISO 20022 institution ID
+	Currency    string `json:"currency"`     // ISO 4217
+	TotalSupply int    `json:"total_supply"` // Current circulation
+	MaxSupply   int    `json:"max_supply"`   // Regulatory cap
+	Status      string `json:"status"`       // ACTIVE/FROZEN/EXPIRED
+	IsFrozen    bool   `json:"is_frozen"`    // Emergency controls
+
+	// Internal/operational fields used by existing business flows.
 	Owner           string         `json:"owner"`
 	OwnerMSP        string         `json:"owner_msp"` // Bank that owns this token (Org1MSP, Org2MSP, Org3MSP)
 	Available       bool           `json:"available"`
-	Minted          int            `json:"minted"`
-	Currency        string         `json:"currency"`
 	DisplayTokenID  string         `json:"display_token_id"`
 	TransferIDs     []string       `json:"transfer_ids"`
 	AssignedAt      string         `json:"assigned_at"`
 	ForeignBalances map[string]int `json:"foreign_balances"`
-	// BetweenNetwork Governance Fields
-	MaxSupply           int     `json:"max_supply"`             // Regulatory cap on total supply
-	DailyMintLimit      float64 `json:"daily_mint_limit"`       // Daily minting allowance
-	TotalMintedToday    float64 `json:"total_minted_today"`     // Rolling 24h counter
-	LastMintRulesUpdate string  `json:"last_mint_rules_update"` // Audit timestamp
-	EmergencyFreeze     bool    `json:"emergency_freeze"`       // Can be set by BetweenNetwork admin
-	Purpose             string  `json:"purpose"`                // BANK_TOKEN or SYSTEM_TOKEN
-	Status              string  `json:"status"`                 // READY_FOR_MINTING, FROZEN, etc.
+	Minted          int            `json:"minted"` // Legacy compatibility; mirrors TotalSupply
+}
+
+func getTokenSupply(t Token) int {
+	if t.TotalSupply != 0 {
+		return t.TotalSupply
+	}
+	return t.Minted
+}
+
+func setTokenSupply(t *Token, amount int) {
+	t.TotalSupply = amount
+	t.Minted = amount
 }
 
 // TokenCommissionConfig stores the commission percentage that a bank charges for transfers
@@ -137,29 +162,62 @@ type SimplifiedTokenResponse struct {
 }
 
 type TokenRequest struct {
-	RequestID          string `json:"request_id"`
-	NetworkAddr        string `json:"network_addr"`
-	ParticipantAddress string `json:"participant_address"`
-	CallerID           string `json:"caller_id"`
-	CallerMSP          string `json:"caller_msp"`
-	ParticipantMSP     string `json:"participant_msp"` // Bank that made the request
-	Status             string `json:"status"`          // PENDING, APPROVED, CANCELLED
-	TokenID            string `json:"token_id"`
-	Currency           string `json:"currency"`
+	MsgID              string `json:"msg_id"`              // Financial message ID
+	InstitutionID      string `json:"institution_id"`      // BIC8/BIC11
+	InstitutionName    string `json:"institution_name"`    // Legal entity name
+	CountryCode        string `json:"country_code"`        // ISO 3166-1 alpha-2
+	CurrencyCode       string `json:"currency_code"`       // ISO 4217
+	TokenID            string `json:"token_id"`            // Assigned on approval
+	RequestPurpose     string `json:"request_purpose"`     // Business request type
+	Status             string `json:"status"`              // PENDING, APPROVED, REJECTED, CANCELLED
+	CreatedAt          string `json:"created_at"`          // RFC3339
+	ValidUntil         string `json:"valid_until"`         // RFC3339 expiry
+	Reference          string `json:"reference"`           // Business reference
+	ApproverID         string `json:"approver_id"`         // Populated at approval
+	RequestID          string `json:"request_id"`          // Legacy compatibility
+	NetworkAddr        string `json:"network_addr"`        // Legacy compatibility
+	ParticipantAddress string `json:"participant_address"` // Legacy compatibility
+	CallerID           string `json:"caller_id"`           // Legacy compatibility
+	CallerMSP          string `json:"caller_msp"`          // Legacy compatibility
+	ParticipantMSP     string `json:"participant_msp"`     // Legacy compatibility
+	Currency           string `json:"currency"`            // Legacy compatibility
 }
 
 type MintRequest struct {
-	RequestID   string `json:"request_id"`
-	TokenID     string `json:"token_id"`
-	CustomerID  string `json:"customer_id"`
-	RequestedBy string `json:"requested_by"`
-	Name        string `json:"name"`
-	KycId       string `json:"kyc_id"`
-	KycStatus   string `json:"kyc_status"`
-	Amount      int    `json:"amount"`
-	Approved    bool   `json:"approved"`
-	ApprovedAt  string `json:"approved_at"`
-	Currency    string `json:"currency"`
+	MsgID          string `json:"msg_id"`           // MT799: transaction reference
+	BIC            string `json:"bic"`              // SWIFT/ISO 20022 bank identifier
+	TokenID        string `json:"token_id"`         // Token identifier
+	CustomerRef    string `json:"customer_ref"`     // Customer reference
+	CustomerID     string `json:"customer_id"`      // Legacy alias for compatibility
+	KycRef         string `json:"kyc_ref"`          // KYC reference
+	Amount         int64  `json:"amount"`           // Mint amount
+	Currency       string `json:"currency"`         // ISO 4217 currency
+	KycStatus      string `json:"kyc_status"`       // VERIFIED/PENDING
+	Status         string `json:"status"`           // PENDING/APPROVED/REJECTED
+	Purpose        string `json:"purpose"`          // WORKING_CAPITAL/SETTLEMENT/LIQUIDITY
+	CreatedAt      string `json:"created_at"`       // RFC3339
+	ApprovedAt     string `json:"approved_at"`      // RFC3339
+	ExpiresAt      string `json:"expires_at"`       // RFC3339 expiry
+	DailyLimitUsed int64  `json:"daily_limit_used"` // Running total for compliance trace
+}
+
+// TokenMintRecord stores token-owner/admin mint operations separately from customer mint requests.
+type TokenMintRecord struct {
+	RecordID     string `json:"record_id"`
+	MsgID        string `json:"msg_id"`
+	RequestID    string `json:"request_id"`
+	BIC          string `json:"bic"`
+	TokenID      string `json:"token_id"`
+	Amount       int64  `json:"amount"`
+	Currency     string `json:"currency"`
+	Purpose      string `json:"purpose"`
+	Status       string `json:"status"`
+	CreatedAt    string `json:"created_at"`
+	ApprovedAt   string `json:"approved_at"`
+	ApprovedBy   string `json:"approved_by"`
+	CustomerRef  string `json:"customer_ref"`
+	CustomerID   string `json:"customer_id"`
+	MintCategory string `json:"mint_category"` // TOKEN_OWNER_MINT
 }
 
 // KYCAnchor stores minimal anchor metadata for off-chain KYC
@@ -177,99 +235,156 @@ type TokenHandshake struct {
 
 // RegisterParticipantRequest for pending participant registrations
 type RegisterParticipantRequest struct {
-	RequestID      string `json:"request_id"`
-	NetworkAddress string `json:"network_address"`
-	Name           string `json:"name"`
-	ClientID       string `json:"client_id"`
-	TokenID        string `json:"token_id"`
-	Approved       bool   `json:"approved"`
-	KycId          string `json:"kyc_id"`
-	KycStatus      string `json:"kyc_status"`
-	CreatedAt      string `json:"created_at"` // SECURITY FIX: Track request creation time for expiration
-	Status         string `json:"status"`     // SECURITY FIX: Track request status (PENDING, REJECTED, APPROVED)
+	MsgID       string `json:"msg_id"`
+	BIC         string `json:"bic"`
+	TokenID     string `json:"token_id"`
+	CustomerRef string `json:"customer_ref"`
+	KycRef      string `json:"kyc_ref"`
+	KycStatus   string `json:"kyc_status"`
+	Status      string `json:"status"`
+	Purpose     string `json:"purpose"`
+	CreatedAt   string `json:"created_at"`
+	ExpiresAt   string `json:"expires_at"`
 }
 
 // TransferRequest struct removed - use TokenTransferRequest instead
 
 type TokenTransferRequest struct {
-	RequestID         string `json:"request_id"`
-	SenderTokenID     string `json:"sender_token_id"`
-	ReceiverTokenID   string `json:"receiver_token_id"`
-	SenderName        string `json:"sender_name"`
-	ReceiverName      string `json:"receiver_name"`
-	SenderKycId       string `json:"sender_kyc_id"`
-	SenderKycStatus   string `json:"sender_kyc_status"`
-	ReceiverKycId     string `json:"receiver_kyc_id"`
-	ReceiverKycStatus string `json:"receiver_kyc_status"`
-	Amount            int    `json:"amount"`
-	InitiatedBy       string `json:"initiated_by"`
-	Status            string `json:"status"` // PendingReceiverApproval, Completed, Rejected
-	CompletedAt       string `json:"completed_at"`
-	Currency          string `json:"currency"`
+	MsgID           string  `json:"msg_id"`            // MT202 field 20
+	SenderBIC       string  `json:"sender_bic"`        // SWIFT BIC
+	ReceiverBIC     string  `json:"receiver_bic"`      // SWIFT BIC
+	SenderTokenID   string  `json:"sender_token_id"`   // Sender token
+	ReceiverTokenID string  `json:"receiver_token_id"` // Receiver token
+	Amount          int64   `json:"amount"`            // Transfer amount
+	Currency        string  `json:"currency"`          // ISO 4217
+	ExchangeRate    float64 `json:"exchange_rate"`     // 1.0 for same-currency transfers
+	Status          string  `json:"status"`            // PENDING/APPROVED/REJECTED/SETTLED
+	Purpose         string  `json:"purpose"`           // RTGS/NEFT/INTERBANK_SETTLEMENT
+	CreatedAt       string  `json:"created_at"`        // RFC3339
+	ExpiresAt       string  `json:"expires_at"`        // RFC3339
+	SettledAt       string  `json:"settled_at,omitempty"`
+
+	// Legacy compatibility for existing consumers.
+	RequestID   string `json:"request_id,omitempty"`
+	InitiatedBy string `json:"initiated_by,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
 }
 
 type TokenToTokenTransferRecord struct {
-	RecordID        string `json:"record_id"`
-	RequestID       string `json:"request_id"`
-	SenderTokenID   string `json:"sender_token_id"`
-	ReceiverTokenID string `json:"receiver_token_id"`
-	Amount          int    `json:"amount"`
-	InitiatedBy     string `json:"initiated_by"`
-	ApprovedBy      string `json:"approved_by"`
-	ApprovedAt      string `json:"approved_at"`
-	Currency        string `json:"currency"`
+	TxRef           string  `json:"tx_ref"`            // SWIFT style settlement reference
+	MsgID           string  `json:"msg_id"`            // Original transfer message ID
+	SenderBIC       string  `json:"sender_bic"`        // Sender institution BIC
+	ReceiverBIC     string  `json:"receiver_bic"`      // Receiver institution BIC
+	SenderTokenID   string  `json:"sender_token_id"`   // Sender token
+	ReceiverTokenID string  `json:"receiver_token_id"` // Receiver token
+	Amount          int64   `json:"amount"`            // Settled amount
+	Currency        string  `json:"currency"`          // ISO 4217
+	ExchangeRate    float64 `json:"exchange_rate"`     // Applied FX rate
+	FeeAmount       int64   `json:"fee_amount"`        // Settlement fee
+	NetAmount       int64   `json:"net_amount"`        // Amount after fee
+	Status          string  `json:"status"`            // SETTLED/FAILED/REVERSED
+	SettledAt       string  `json:"settled_at"`        // Final settlement timestamp
+	BlockHeight     string  `json:"block_height"`      // Immutable ledger proof marker
+	Purpose         string  `json:"purpose"`           // RTGS/NEFT/INTERBANK_SETTLEMENT
+
+	// Legacy compatibility aliases.
+	RecordID    string `json:"record_id,omitempty"`
+	RequestID   string `json:"request_id,omitempty"`
+	InitiatedBy string `json:"initiated_by,omitempty"`
+	ApprovedBy  string `json:"approved_by,omitempty"`
+	ApprovedAt  string `json:"approved_at,omitempty"`
 }
 
 type ParticipantTransferRecord struct {
-	RecordID              string  `json:"record_id"`
-	TransferRequestID     string  `json:"transfer_request_id"`
-	TransferID            string  `json:"transfer_id"`
-	TokenID               string  `json:"token_id"`
-	SenderParticipantID   string  `json:"sender_participant_id"`
-	ReceiverParticipantID string  `json:"receiver_participant_id"`
-	SenderName            string  `json:"sender_name"`
-	ReceiverName          string  `json:"receiver_name"`
-	SenderKycId           string  `json:"sender_kyc_id"`
-	SenderKycStatus       string  `json:"sender_kyc_status"`
-	ReceiverKycId         string  `json:"receiver_kyc_id"`
-	ReceiverKycStatus     string  `json:"receiver_kyc_status"`
-	SenderTokenID         string  `json:"sender_token_id"`
-	ReceiverTokenID       string  `json:"receiver_token_id"`
-	Amount                float64 `json:"amount"`
-	CompletedAt           string  `json:"completed_at"`
+	TxRef               string  `json:"tx_ref"`
+	RequestMsgID        string  `json:"request_msg_id"`
+	SenderCustomerRef   string  `json:"sender_customer_ref"`
+	SenderBIC           string  `json:"sender_bic"`
+	ReceiverCustomerRef string  `json:"receiver_customer_ref"`
+	ReceiverBIC         string  `json:"receiver_bic"`
+	Amount              int64   `json:"amount"`
+	Currency            string  `json:"currency"`
+	Commission          int64   `json:"commission"`
+	NetAmount           int64   `json:"net_amount"`
+	ExchangeRate        float64 `json:"exchange_rate"`
+	Status              string  `json:"status"`
+	SettledAt           string  `json:"settled_at"`
+	BlockHeight         string  `json:"block_height"`
+
+	// Legacy compatibility aliases.
+	RecordID              string `json:"record_id,omitempty"`
+	TransferRequestID     string `json:"transfer_request_id,omitempty"`
+	TransferID            string `json:"transfer_id,omitempty"`
+	TokenID               string `json:"token_id,omitempty"`
+	SenderParticipantID   string `json:"sender_participant_id,omitempty"`
+	ReceiverParticipantID string `json:"receiver_participant_id,omitempty"`
+	SenderName            string `json:"sender_name,omitempty"`
+	ReceiverName          string `json:"receiver_name,omitempty"`
+	SenderKycId           string `json:"sender_kyc_id,omitempty"`
+	SenderKycStatus       string `json:"sender_kyc_status,omitempty"`
+	ReceiverKycId         string `json:"receiver_kyc_id,omitempty"`
+	ReceiverKycStatus     string `json:"receiver_kyc_status,omitempty"`
+	SenderTokenID         string `json:"sender_token_id,omitempty"`
+	ReceiverTokenID       string `json:"receiver_token_id,omitempty"`
+	CompletedAt           string `json:"completed_at,omitempty"`
+}
+
+type CustomerTokenAccount struct {
+	CustomerRef    string `json:"customer_ref"`
+	CustomerID     string `json:"customer_id"`
+	TokenID        string `json:"token_id"`
+	BIC            string `json:"bic"`
+	Approved       bool   `json:"approved"`
+	Status         string `json:"status"`
+	NetworkAddress string `json:"network_address"`
 }
 
 // CustomerToTokenTransferRequest represents a customer initiating a transfer to another token (which forwards to another customer)
 // Flow: Sender Customer (Token A) → Receiver Token B → Receiver Customer (Token B)
 // Receiver Token takes 2% commission, forwards 98% to Receiver Customer
 type CustomerToTokenTransferRequest struct {
+	MsgID               string  `json:"msg_id"`                // Privacy-safe transaction reference
+	SenderCustomerRef   string  `json:"sender_customer_ref"`   // Business-safe customer reference
+	SenderBIC           string  `json:"sender_bic"`            // Sender bank BIC
+	ReceiverCustomerRef string  `json:"receiver_customer_ref"` // Business-safe customer reference
+	ReceiverBIC         string  `json:"receiver_bic"`          // Receiver bank BIC
+	Amount              int64   `json:"amount"`                // Sender amount
+	Currency            string  `json:"currency"`              // Sender currency
+	Status              string  `json:"status"`                // PENDING_SENDER/PENDING_RECEIVER/SETTLED/REJECTED_SENDER_PRE_ESCROW/REJECTED_RECEIVER/EXPIRED_ESCROW_RETURNED/FAILED_TECHNICAL
+	RejectionReason     string  `json:"rejection_reason"`
+	RejectedAt          string  `json:"rejected_at"`
+	EscrowAmount        int64   `json:"escrow_amount"`        // Locked sender amount
+	CommissionPct       float64 `json:"commission_pct"`       // Commission percentage ratio (0.02 = 2%)
+	CommissionAmount    int64   `json:"commission_amount"`    // Commission amount
+	NetReceiverAmount   int64   `json:"net_receiver_amount"`  // Final amount credited to receiver customer
+	ExchangeRate        float64 `json:"exchange_rate"`        // FX rate if currency differs
+	CreatedAt           string  `json:"created_at"`           // RFC3339
+	SettledAt           string  `json:"settled_at"` // RFC3339
+
+	// Internal/legacy compatibility fields retained for existing flows.
 	TransferRequestID            string  `json:"transfer_request_id"`
-	SenderCustomerID             string  `json:"sender_customer_id"`     // Customer's network address (Token A owner)
+	SenderCustomerID             string  `json:"sender_customer_id"` // Customer network address
 	SenderCustomerTokenID        string  `json:"sender_customer_token_id"`
-	SenderCustomerName           string  `json:"sender_customer_name"`   // Sender customer's name
-	SenderTokenID                string  `json:"sender_token_id"`        // Token A (sender customer's token)
-	ReceiverTokenID              string  `json:"receiver_token_id"`      // Token B (intermediate receiver, takes commission)
-	ReceiverCustomerID           string  `json:"receiver_customer_id"`   // Final destination customer (must be registered with Token B)
+	SenderCustomerName           string  `json:"sender_customer_name"`
+	SenderTokenID                string  `json:"sender_token_id"`
+	ReceiverTokenID              string  `json:"receiver_token_id"`
+	ReceiverCustomerID           string  `json:"receiver_customer_id"` // Customer network address
 	ReceiverCustomerTokenID      string  `json:"receiver_customer_token_id"`
-	ReceiverCustomerName         string  `json:"receiver_customer_name"` // Receiver customer's name
-	Amount                       int     `json:"amount"`                 // In sender's currency
-	SenderCurrency               string  `json:"sender_currency"`        // Currency of sender token
-	Status                       string  `json:"status"`                 // PendingSenderTokenApproval, PendingReceiverTokenApproval, Completed, RejectedBySenderOwner, RejectedByReceiverOwner
-	InitiatedBy                  string  `json:"initiated_by"`           // Customer's certificate ID
-	DebitStatus                  string  `json:"debit_status"`           // DEBITED, REVERSED
-	CreditStatus                 string  `json:"credit_status"`          // PENDING, CREDITED
-	EscrowedAmount               int     `json:"escrowed_amount"`        // Amount in escrow
+	ReceiverCustomerName         string  `json:"receiver_customer_name"`
+	SenderCurrency               string  `json:"sender_currency"` // Legacy
+	InitiatedBy                  string  `json:"initiated_by"`
+	DebitStatus                  string  `json:"debit_status"`
+	CreditStatus                 string  `json:"credit_status"`
+	EscrowedAmount               int64   `json:"escrowed_amount"` // Legacy alias
 	ApprovedBySenderOwner        bool    `json:"approved_by_sender_owner"`
 	ApprovedByReceiverOwner      bool    `json:"approved_by_receiver_owner"`
 	SenderTokenOwnerApprovedAt   string  `json:"sender_approved_at"`
 	ReceiverTokenOwnerApprovedAt string  `json:"receiver_approved_at"`
 	CompletedAt                  string  `json:"completed_at"`
-	ReceiverCurrency             string  `json:"receiver_currency"`        // For wallet display
-	CommissionPercentage         float64 `json:"commission_percentage"`    // 2.0 (represents 2%)
-	CommissionAmount             int     `json:"commission_amount"`        // 2% commission kept by receiver token
-	ReceiverCustomerAmount       int     `json:"receiver_customer_amount"` // 98% forwarded to receiver customer
-	ExchangeRate                 float64 `json:"exchange_rate"`            // Exchange rate used (if different currencies): 1 SenderCurrency = X ReceiverCurrency
-	ConvertedAmount              float64 `json:"converted_amount"`         // Full amount converted to receiver currency
+	ReceiverCurrency             string  `json:"receiver_currency"` // Legacy
+	CommissionPercentage         float64 `json:"commission_percentage"`
+	ReceiverCustomerAmount       int64   `json:"receiver_customer_amount"`
+	ConvertedAmount              float64 `json:"converted_amount"`
 }
 
 // TransactionHistoryRecord stores transaction history for both mint and transfer transactions
@@ -326,10 +441,10 @@ func appendTransferIfMissing(list []string, transferID string) []string {
 }
 
 const (
-	participantStatePrefix      = "participant_"
-	participantIndexPrefix      = "participantidx_"
-	customerIDUniquePrefix      = "customerid_"
-	customerIDTokenIndexPrefix  = "participantbytoken_"
+	participantStatePrefix     = "participant_"
+	participantIndexPrefix     = "participantidx_"
+	customerIDUniquePrefix     = "customerid_"
+	customerIDTokenIndexPrefix = "participantbytoken_"
 )
 
 func participantLegacyStateKey(networkAddress, tokenID string) string {
@@ -436,7 +551,110 @@ func (s *SmartContract) getParticipantByNetworkToken(ctx contractapi.Transaction
 	if err := json.Unmarshal(raw, &participant); err != nil {
 		return nil, "", fmt.Errorf("invalid customer record: %w", err)
 	}
+	normalizeParticipantForRead(&participant)
 	return &participant, stateKey, nil
+}
+
+func (s *SmartContract) getParticipantByCustomerIDToken(ctx contractapi.TransactionContextInterface, customerID, tokenID string) (*Participant, string, error) {
+	customerID = strings.TrimSpace(customerID)
+	tokenID = strings.TrimSpace(tokenID)
+	if customerID == "" || tokenID == "" {
+		return nil, "", fmt.Errorf("customer_id and token_id are required")
+	}
+	indexKey := customerIDTokenIndexKey(tokenID, customerID)
+	stateKeyBytes, err := ctx.GetStub().GetState(indexKey)
+	if err != nil {
+		return nil, "", err
+	}
+	if stateKeyBytes == nil {
+		return nil, "", fmt.Errorf("customer record not found")
+	}
+	stateKey := strings.TrimSpace(string(stateKeyBytes))
+	raw, err := ctx.GetStub().GetState(stateKey)
+	if err != nil {
+		return nil, "", err
+	}
+	if raw == nil {
+		return nil, "", fmt.Errorf("customer state missing")
+	}
+	var participant Participant
+	if err := json.Unmarshal(raw, &participant); err != nil {
+		return nil, "", fmt.Errorf("invalid customer record: %w", err)
+	}
+	normalizeParticipantForRead(&participant)
+	return &participant, stateKey, nil
+}
+
+func decodeBase64Candidate(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(trimmed)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(decoded))
+}
+
+func customerRefMatches(ref string, candidates ...string) bool {
+	normalizedRef := strings.TrimSpace(ref)
+	if normalizedRef == "" {
+		return false
+	}
+	for _, candidate := range candidates {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed == "" {
+			continue
+		}
+		if trimmed == normalizedRef {
+			return true
+		}
+		decodedCandidate := decodeBase64Candidate(trimmed)
+		if decodedCandidate != "" && decodedCandidate == normalizedRef {
+			return true
+		}
+		decodedRef := decodeBase64Candidate(normalizedRef)
+		if decodedRef != "" && decodedRef == trimmed {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SmartContract) findPendingCustomerRegistration(ctx contractapi.TransactionContextInterface, networkAddress, tokenID, callerID string) (*RegisterParticipantRequest, error) {
+	trimmedTokenID := strings.TrimSpace(tokenID)
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !isRegisterParticipantRequestKey(kv.Key) {
+			continue
+		}
+		var req RegisterParticipantRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		if strings.TrimSpace(req.TokenID) != trimmedTokenID {
+			continue
+		}
+		if strings.ToUpper(strings.TrimSpace(req.Status)) != "PENDING" {
+			continue
+		}
+		if !customerRefMatches(req.CustomerRef, networkAddress, callerID) {
+			continue
+		}
+		copyReq := req
+		return &copyReq, nil
+	}
+	return nil, nil
 }
 
 func currencySymbol(code string) string {
@@ -470,6 +688,9 @@ func currencySymbol(code string) string {
 }
 
 func formatCurrencyValue(code string, amount float64) string {
+	if strings.TrimSpace(code) == "" {
+		return fmt.Sprintf("%.2f", amount)
+	}
 	symbol := currencySymbol(code)
 	return fmt.Sprintf("%s%.2f", symbol, amount)
 }
@@ -736,12 +957,18 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 		tokenID := fmt.Sprintf("token_%d", i)
 		token := Token{
 			TokenID:         tokenID,
+			BIC:             "",
+			Currency:        "",
+			TotalSupply:     0,
+			MaxSupply:       0,
+			Status:          "ACTIVE",
+			IsFrozen:        false,
 			Owner:           "",
 			Available:       true,
-			Minted:          0,
-			Currency:        "",
+			DisplayTokenID:  "",
 			TransferIDs:     []string{},
 			ForeignBalances: make(map[string]int),
+			Minted:          0,
 		}
 		tokenBytes, _ := json.Marshal(token)
 		if err := ctx.GetStub().PutState(tokenID, tokenBytes); err != nil {
@@ -775,6 +1002,8 @@ func (s *SmartContract) SubmitRegistration(ctx contractapi.TransactionContextInt
 
 	// Create participant with MSP field to track which bank they belong to
 	p := Participant{
+		CustomerRef:    netAddr,
+		Status:         "PENDING",
 		Name:           name,
 		NetworkAddress: netAddr,
 		ClientID:       clientID,
@@ -785,6 +1014,7 @@ func (s *SmartContract) SubmitRegistration(ctx contractapi.TransactionContextInt
 		KycId:          "",
 		KycStatus:      "",
 	}
+	normalizeParticipantForWrite(&p, "", "")
 	b, _ := json.Marshal(p)
 	if err := ctx.GetStub().PutState(netAddr, b); err != nil {
 		return "", err
@@ -894,73 +1124,1031 @@ func (s *SmartContract) VerifyBankIdentity(ctx contractapi.TransactionContextInt
 	return "", fmt.Errorf("access denied: caller is not a registered bank")
 }
 
-// RequestTokenRequest allows participant to request token purchase; only if details match
-func (s *SmartContract) RequestTokenRequest(ctx contractapi.TransactionContextInterface, name, networkAddress, country, currency string) error {
-	// SECURITY FIX #1: Validate networkAddress format - cannot be empty
-	networkAddress = strings.TrimSpace(networkAddress)
-	if networkAddress == "" {
-		return fmt.Errorf("network address cannot be empty")
+func validBICFormat(institutionID string) bool {
+	return regexp.MustCompile(`^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$`).MatchString(institutionID)
+}
+
+func validCountryCode(code string) bool {
+	return regexp.MustCompile(`^[A-Z]{2}$`).MatchString(code)
+}
+
+func validCurrencyCode(code string) bool {
+	return regexp.MustCompile(`^[A-Z]{3}$`).MatchString(code)
+}
+
+const (
+	maxMintRequestAmount      int64 = 100000000
+	mintRequestTTLDays              = 7
+	mintPurposeWorkingCapital       = "WORKING_CAPITAL"
+	mintPurposeSettlement           = "SETTLEMENT"
+	mintPurposeLiquidity            = "LIQUIDITY"
+)
+
+func validMintPurpose(purpose string) bool {
+	switch strings.TrimSpace(strings.ToUpper(purpose)) {
+	case mintPurposeWorkingCapital, mintPurposeSettlement, mintPurposeLiquidity:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	transferPurposeRTGS                = "RTGS"
+	transferPurposeNEFT                = "NEFT"
+	transferPurposeInterbankSettlement = "INTERBANK_SETTLEMENT"
+	transferRequestTTLHours            = 24
+)
+
+func validBankTransferPurpose(purpose string) bool {
+	switch strings.TrimSpace(strings.ToUpper(purpose)) {
+	case transferPurposeRTGS, transferPurposeNEFT, transferPurposeInterbankSettlement:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeTokenTransferStatus(status string) string {
+	switch strings.TrimSpace(strings.ToUpper(status)) {
+	case "PENDING", "PENDINGRECEIVERAPPROVAL":
+		return "PENDING"
+	case "APPROVED":
+		return "APPROVED"
+	case "SETTLED", "COMPLETED":
+		return "SETTLED"
+	case "REJECTED":
+		return "REJECTED"
+	default:
+		return strings.TrimSpace(strings.ToUpper(status))
+	}
+}
+
+func normalizeTokenTransferRequestForRead(req *TokenTransferRequest) {
+	if req == nil {
+		return
+	}
+	req.Status = normalizeTokenTransferStatus(req.Status)
+	if strings.TrimSpace(req.MsgID) == "" {
+		req.MsgID = strings.TrimSpace(req.RequestID)
+	}
+	if strings.TrimSpace(req.Currency) == "" {
+		req.Currency = "INR"
+	}
+	if req.ExchangeRate == 0 {
+		req.ExchangeRate = 1.0
+	}
+	if strings.TrimSpace(req.SettledAt) == "" && strings.TrimSpace(req.CompletedAt) != "" {
+		req.SettledAt = req.CompletedAt
+	}
+	if strings.TrimSpace(req.CompletedAt) == "" && strings.TrimSpace(req.SettledAt) != "" {
+		req.CompletedAt = req.SettledAt
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		req.RequestID = req.MsgID
+	}
+}
+
+func isTokenTransferRequestKey(key string) bool {
+	return strings.HasPrefix(key, "tokentransfer_") || strings.Contains(key, "/TRANSFER/")
+}
+
+func isTokenToTokenTransferHistoryKey(key string) bool {
+	return strings.HasPrefix(key, "tokentotransferhistory_") || strings.Contains(key, "/SETTLED/")
+}
+
+func normalizeTokenToTokenTransferRecordForRead(record *TokenToTokenTransferRecord) {
+	if record == nil {
+		return
+	}
+	if strings.TrimSpace(record.TxRef) == "" {
+		record.TxRef = strings.TrimSpace(record.RecordID)
+	}
+	if strings.TrimSpace(record.RecordID) == "" {
+		record.RecordID = strings.TrimSpace(record.TxRef)
+	}
+	if strings.TrimSpace(record.MsgID) == "" {
+		record.MsgID = strings.TrimSpace(record.RequestID)
+	}
+	if strings.TrimSpace(record.RequestID) == "" {
+		record.RequestID = strings.TrimSpace(record.MsgID)
+	}
+	if strings.TrimSpace(record.SettledAt) == "" {
+		if strings.TrimSpace(record.ApprovedAt) != "" {
+			record.SettledAt = strings.TrimSpace(record.ApprovedAt)
+		}
+	}
+	if strings.TrimSpace(record.ApprovedAt) == "" && strings.TrimSpace(record.SettledAt) != "" {
+		record.ApprovedAt = strings.TrimSpace(record.SettledAt)
+	}
+	if record.Amount == 0 && record.NetAmount > 0 {
+		record.Amount = record.NetAmount
+	}
+	if record.NetAmount == 0 {
+		if record.FeeAmount > 0 {
+			record.NetAmount = record.Amount - record.FeeAmount
+		} else {
+			record.NetAmount = record.Amount
+		}
+	}
+	if record.ExchangeRate == 0 {
+		record.ExchangeRate = 1.0
+	}
+	if strings.TrimSpace(record.Status) == "" {
+		record.Status = "SETTLED"
+	}
+}
+
+func (s *SmartContract) resolveTokenTransferStateKey(ctx contractapi.TransactionContextInterface, requestRef string) (string, error) {
+	requestRef = strings.TrimSpace(requestRef)
+	if requestRef == "" {
+		return "", fmt.Errorf("transfer request reference required")
+	}
+	if raw, err := ctx.GetStub().GetState(requestRef); err == nil && raw != nil {
+		return requestRef, nil
 	}
 
-	// SECURITY FIX #2: Validate currency is provided and not empty
-	currency = strings.TrimSpace(currency)
-	if currency == "" {
-		return fmt.Errorf("currency is required")
+	legacyKey := "tokentransfer_" + requestRef
+	if raw, err := ctx.GetStub().GetState(legacyKey); err == nil && raw != nil {
+		return legacyKey, nil
 	}
 
-	// SECURITY: Extract and verify caller identity first
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return "", err
+		}
+		if !isTokenTransferRequestKey(kv.Key) {
+			continue
+		}
+		var req TokenTransferRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		normalizeTokenTransferRequestForRead(&req)
+		if strings.TrimSpace(req.MsgID) == requestRef || strings.TrimSpace(req.RequestID) == requestRef {
+			return kv.Key, nil
+		}
+	}
+	return "", fmt.Errorf("token transfer request not found: %s", requestRef)
+}
+
+func normalizeCustomerTransferStatus(status string) string {
+	switch strings.TrimSpace(strings.ToUpper(status)) {
+	case "PENDINGSENDERTOKENAPPROVAL", "PENDING_SENDER":
+		return "PENDING_SENDER"
+	case "PENDINGRECEIVERTOKENAPPROVAL", "PENDING_RECEIVER":
+		return "PENDING_RECEIVER"
+	case "COMPLETED", "SETTLED":
+		return "SETTLED"
+	case "REJECTEDBYSENDEROWNER":
+		return "REJECTED_SENDER_PRE_ESCROW"
+	case "REJECTEDBYRECEIVEROWNER":
+		return "REJECTED_RECEIVER"
+	case "REJECTED":
+		return "REJECTED_RECEIVER"
+	case "EXPIRED_ESCROW_RETURNED", "FAILED_TECHNICAL", "REJECTED_SENDER_PRE_ESCROW", "REJECTED_RECEIVER":
+		return strings.TrimSpace(strings.ToUpper(status))
+	default:
+		return strings.TrimSpace(strings.ToUpper(status))
+	}
+}
+
+const (
+	customerTransferStatusRejectedSenderPreEscrow = "REJECTED_SENDER_PRE_ESCROW"
+	customerTransferStatusRejectedReceiver        = "REJECTED_RECEIVER"
+	customerTransferStatusExpiredEscrowReturned   = "EXPIRED_ESCROW_RETURNED"
+	customerTransferStatusFailedTechnical         = "FAILED_TECHNICAL"
+)
+
+var validCustomerTransferRejectionReasons = map[string]struct{}{
+	"INSUFFICIENT_BALANCE":    {},
+	"DAILY_LIMIT_EXCEEDED":    {},
+	"SENDER_KYC_INVALID":      {},
+	"RECEIVER_NOT_REGISTERED": {},
+	"RECEIVER_KYC_INVALID":    {},
+	"BANK_POLICY_VIOLATION":   {},
+	"24HR_TIMEOUT":            {},
+	"ESCROW_CREATION_FAILED":  {},
+	"SMART_CONTRACT_ERROR":    {},
+}
+
+func normalizeCustomerTransferRejectionReason(reason string) string {
+	normalized := strings.TrimSpace(strings.ToUpper(reason))
+	if normalized == "" {
+		return ""
+	}
+	if _, ok := validCustomerTransferRejectionReasons[normalized]; ok {
+		return normalized
+	}
+	return "SMART_CONTRACT_ERROR"
+}
+
+func isCustomerTransferRejectedStatus(status string) bool {
+	switch normalizeCustomerTransferStatus(status) {
+	case customerTransferStatusRejectedSenderPreEscrow,
+		customerTransferStatusRejectedReceiver,
+		customerTransferStatusExpiredEscrowReturned,
+		customerTransferStatusFailedTechnical:
+		return true
+	default:
+		return false
+	}
+}
+
+func isCustomerTransferPendingSender(status string) bool {
+	return normalizeCustomerTransferStatus(status) == "PENDING_SENDER"
+}
+
+func isCustomerTransferPendingReceiver(status string) bool {
+	return normalizeCustomerTransferStatus(status) == "PENDING_RECEIVER"
+}
+
+func normalizeCustomerToTokenTransferRequestForRead(req *CustomerToTokenTransferRequest) {
+	if req == nil {
+		return
+	}
+	req.Status = normalizeCustomerTransferStatus(req.Status)
+	if strings.TrimSpace(req.MsgID) == "" {
+		req.MsgID = strings.TrimSpace(req.TransferRequestID)
+	}
+	if strings.TrimSpace(req.TransferRequestID) == "" {
+		req.TransferRequestID = strings.TrimSpace(req.MsgID)
+	}
+	if strings.TrimSpace(req.SenderCustomerRef) == "" {
+		if strings.TrimSpace(req.SenderCustomerTokenID) != "" {
+			req.SenderCustomerRef = strings.TrimSpace(req.SenderCustomerTokenID)
+		} else {
+			req.SenderCustomerRef = strings.TrimSpace(req.SenderCustomerID)
+		}
+	}
+	if strings.TrimSpace(req.ReceiverCustomerRef) == "" {
+		if strings.TrimSpace(req.ReceiverCustomerTokenID) != "" {
+			req.ReceiverCustomerRef = strings.TrimSpace(req.ReceiverCustomerTokenID)
+		} else {
+			req.ReceiverCustomerRef = strings.TrimSpace(req.ReceiverCustomerID)
+		}
+	}
+	if req.Amount == 0 {
+		if req.EscrowAmount > 0 {
+			req.Amount = req.EscrowAmount
+		} else if req.EscrowedAmount > 0 {
+			req.Amount = req.EscrowedAmount
+		}
+	}
+	if req.EscrowAmount == 0 && req.EscrowedAmount > 0 {
+		req.EscrowAmount = req.EscrowedAmount
+	}
+	if req.EscrowedAmount == 0 && req.EscrowAmount > 0 {
+		req.EscrowedAmount = req.EscrowAmount
+	}
+	if req.CommissionPct == 0 && req.CommissionPercentage != 0 {
+		// commission_percentage was historically stored as percentage points (2.0)
+		req.CommissionPct = req.CommissionPercentage / 100.0
+	}
+	if req.CommissionPercentage == 0 && req.CommissionPct != 0 {
+		req.CommissionPercentage = req.CommissionPct * 100.0
+	}
+	if req.NetReceiverAmount == 0 && req.ReceiverCustomerAmount > 0 {
+		req.NetReceiverAmount = req.ReceiverCustomerAmount
+	}
+	if req.ReceiverCustomerAmount == 0 && req.NetReceiverAmount > 0 {
+		req.ReceiverCustomerAmount = req.NetReceiverAmount
+	}
+	if req.Currency == "" {
+		req.Currency = strings.TrimSpace(req.SenderCurrency)
+	}
+	if req.SenderCurrency == "" {
+		req.SenderCurrency = strings.TrimSpace(req.Currency)
+	}
+	if req.SettledAt == "" && req.CompletedAt != "" {
+		req.SettledAt = req.CompletedAt
+	}
+	if req.CompletedAt == "" && req.SettledAt != "" {
+		req.CompletedAt = req.SettledAt
+	}
+	req.RejectionReason = normalizeCustomerTransferRejectionReason(req.RejectionReason)
+	if req.RejectedAt == "" && isCustomerTransferRejectedStatus(req.Status) && req.CompletedAt != "" {
+		req.RejectedAt = req.CompletedAt
+	}
+}
+
+func isCustomerTransferKey(key string) bool {
+	return strings.HasPrefix(key, "custtotoken_") || strings.HasPrefix(key, "TRANSFERS/") || strings.Contains(key, "/TRANSFER/")
+}
+
+func (s *SmartContract) resolveCustomerTransferStateKey(ctx contractapi.TransactionContextInterface, requestRef string) (string, error) {
+	requestRef = strings.TrimSpace(requestRef)
+	if requestRef == "" {
+		return "", fmt.Errorf("transferRequestID is required")
+	}
+	if raw, err := ctx.GetStub().GetState(requestRef); err == nil && raw != nil {
+		return requestRef, nil
+	}
+
+	legacyKey := "custtotoken_" + requestRef
+	if raw, err := ctx.GetStub().GetState(legacyKey); err == nil && raw != nil {
+		return legacyKey, nil
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return "", err
+		}
+		if !isCustomerTransferKey(kv.Key) {
+			continue
+		}
+		var req CustomerToTokenTransferRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		normalizeCustomerToTokenTransferRequestForRead(&req)
+		if req.TransferRequestID == requestRef || req.MsgID == requestRef {
+			return kv.Key, nil
+		}
+	}
+	return "", fmt.Errorf("transfer request not found")
+}
+
+func normalizeParticipantTransferRecordForRead(record *ParticipantTransferRecord) {
+	if record == nil {
+		return
+	}
+	if strings.TrimSpace(record.TxRef) == "" {
+		record.TxRef = strings.TrimSpace(record.RecordID)
+	}
+	if strings.TrimSpace(record.RecordID) == "" {
+		record.RecordID = strings.TrimSpace(record.TxRef)
+	}
+	if strings.TrimSpace(record.RequestMsgID) == "" {
+		if strings.TrimSpace(record.TransferRequestID) != "" {
+			record.RequestMsgID = strings.TrimSpace(record.TransferRequestID)
+		} else {
+			record.RequestMsgID = strings.TrimSpace(record.TransferID)
+		}
+	}
+	if strings.TrimSpace(record.TransferRequestID) == "" {
+		record.TransferRequestID = strings.TrimSpace(record.RequestMsgID)
+	}
+	if strings.TrimSpace(record.TransferID) == "" {
+		record.TransferID = strings.TrimSpace(record.RequestMsgID)
+	}
+	if strings.TrimSpace(record.SenderParticipantID) == "" {
+		record.SenderParticipantID = strings.TrimSpace(record.SenderCustomerRef)
+	}
+	if strings.TrimSpace(record.ReceiverParticipantID) == "" {
+		record.ReceiverParticipantID = strings.TrimSpace(record.ReceiverCustomerRef)
+	}
+	if strings.TrimSpace(record.SettledAt) == "" && strings.TrimSpace(record.CompletedAt) != "" {
+		record.SettledAt = strings.TrimSpace(record.CompletedAt)
+	}
+	if strings.TrimSpace(record.CompletedAt) == "" && strings.TrimSpace(record.SettledAt) != "" {
+		record.CompletedAt = strings.TrimSpace(record.SettledAt)
+	}
+	if strings.TrimSpace(record.Status) == "" {
+		record.Status = "SETTLED"
+	}
+	if record.ExchangeRate == 0 {
+		record.ExchangeRate = 1.0
+	}
+	if record.NetAmount == 0 {
+		record.NetAmount = record.Amount - record.Commission
+	}
+}
+
+func (s *SmartContract) findCustomerByRefAndBIC(ctx contractapi.TransactionContextInterface, customerRef, bic string) (*Participant, string, error) {
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, "", err
+	}
+	defer iter.Close()
+	targetRef := strings.TrimSpace(customerRef)
+	targetBIC := strings.TrimSpace(strings.ToUpper(bic))
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, "", err
+		}
+		if !strings.HasPrefix(kv.Key, "participant_") {
+			continue
+		}
+		var p Participant
+		if err := json.Unmarshal(kv.Value, &p); err != nil {
+			continue
+		}
+		normalizeParticipantForRead(&p)
+		ref := strings.TrimSpace(p.CustomerRef)
+		customerID := strings.TrimSpace(p.CustomerID)
+		networkAddress := strings.TrimSpace(p.NetworkAddress)
+		if ref == "" {
+			ref = customerID
+		}
+		pBIC := strings.TrimSpace(strings.ToUpper(p.BIC))
+		if pBIC == "" && p.TokenID != "" {
+			if tokenBytes, e := ctx.GetStub().GetState(p.TokenID); e == nil && tokenBytes != nil {
+				var t Token
+				if json.Unmarshal(tokenBytes, &t) == nil {
+					if resolved, re := s.resolveTokenBIC(ctx, t); re == nil {
+						pBIC = strings.TrimSpace(strings.ToUpper(resolved))
+					}
+				}
+			}
+		}
+		refMatched := customerRefMatches(
+			targetRef,
+			ref,
+			customerID,
+			networkAddress,
+		)
+		if refMatched && pBIC == targetBIC && p.TokenID != "" && p.Approved {
+			return &p, kv.Key, nil
+		}
+	}
+	return nil, "", fmt.Errorf("customer %s not found for bank %s", customerRef, bic)
+}
+
+func (s *SmartContract) findApprovedCustomerByCaller(ctx contractapi.TransactionContextInterface, callerID string) (*Participant, string, error) {
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, "", err
+	}
+	defer iter.Close()
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, "", err
+		}
+		if !strings.HasPrefix(kv.Key, "participant_") {
+			continue
+		}
+		var p Participant
+		if err := json.Unmarshal(kv.Value, &p); err != nil {
+			continue
+		}
+		normalizeParticipantForRead(&p)
+		if strings.TrimSpace(p.ClientID) == strings.TrimSpace(callerID) && p.TokenID != "" && p.Approved {
+			return &p, kv.Key, nil
+		}
+	}
+	return nil, "", fmt.Errorf("approved sender customer not found for caller")
+}
+
+func isMintRequestKey(key string) bool {
+	return strings.HasPrefix(key, "mintrequest_") || strings.HasPrefix(key, "custmintreq_") || strings.Contains(key, "/MINT/")
+}
+
+func isMintRequestPending(req MintRequest) bool {
+	return strings.TrimSpace(strings.ToUpper(req.Status)) == "PENDING" || strings.TrimSpace(req.Status) == ""
+}
+
+func isMintRequestApproved(req MintRequest) bool {
+	return strings.TrimSpace(strings.ToUpper(req.Status)) == "APPROVED"
+}
+
+func isCustomerScopedMintRequest(req MintRequest) bool {
+	ref := strings.TrimSpace(mintRequestCustomerRef(req))
+	if ref == "" {
+		return false
+	}
+	upperRef := strings.ToUpper(ref)
+	// Customer IDs are token-scoped customer identifiers (e.g. CUST_TOKEN...).
+	return strings.HasPrefix(upperRef, "CUST_")
+}
+
+func mintRequestCustomerRef(req MintRequest) string {
+	customerRef := strings.TrimSpace(req.CustomerRef)
+	if customerRef != "" {
+		return customerRef
+	}
+	return strings.TrimSpace(req.CustomerID)
+}
+
+func setMintRequestCustomerRef(req *MintRequest, customerRef string) {
+	ref := strings.TrimSpace(customerRef)
+	req.CustomerRef = ref
+	req.CustomerID = ref // legacy alias for existing consumers
+}
+
+func tokenMintRecordStateKey(bic, recordID string) string {
+	return fmt.Sprintf("%s/TMINT/%s", strings.TrimSpace(strings.ToUpper(bic)), strings.TrimSpace(recordID))
+}
+
+func isTokenMintRecordKey(key string) bool {
+	return strings.HasPrefix(key, "tokenmint_") || strings.Contains(key, "/TMINT/")
+}
+
+func appendUniqueRefs(dst []string, src []string) []string {
+	seen := make(map[string]struct{}, len(dst))
+	for _, item := range dst {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+	}
+	for _, item := range src {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		dst = append(dst, trimmed)
+		seen[trimmed] = struct{}{}
+	}
+	return dst
+}
+
+func normalizeParticipantForRead(p *Participant) {
+	if p == nil {
+		return
+	}
+	if strings.TrimSpace(p.CustomerRef) == "" {
+		switch {
+		case strings.TrimSpace(p.CustomerID) != "":
+			p.CustomerRef = strings.TrimSpace(p.CustomerID)
+		default:
+			p.CustomerRef = strings.TrimSpace(p.NetworkAddress)
+		}
+	}
+	if strings.TrimSpace(p.CustomerID) == "" {
+		p.CustomerID = strings.TrimSpace(p.CustomerRef)
+	}
+	if strings.TrimSpace(p.KycRef) == "" {
+		p.KycRef = strings.TrimSpace(p.KycId)
+	}
+	if strings.TrimSpace(p.KycId) == "" {
+		p.KycId = strings.TrimSpace(p.KycRef)
+	}
+	if strings.TrimSpace(p.Status) == "" {
+		if p.Approved {
+			p.Status = "ACTIVE"
+		} else {
+			p.Status = "PENDING"
+		}
+	}
+	if strings.TrimSpace(p.ActivatedAt) == "" && strings.TrimSpace(p.ApprovedAt) != "" {
+		p.ActivatedAt = p.ApprovedAt
+	}
+	if strings.TrimSpace(p.ApprovedAt) == "" && strings.TrimSpace(p.ActivatedAt) != "" {
+		p.ApprovedAt = p.ActivatedAt
+	}
+	if p.ForeignBalances == nil {
+		p.ForeignBalances = make(map[string]int64)
+	}
+	if len(p.ForeignBalances) == 0 && len(p.ForeignCurrencies) > 0 {
+		for code, amount := range p.ForeignCurrencies {
+			p.ForeignBalances[code] = int64(math.Round(amount))
+		}
+	}
+	if p.ForeignCurrencies == nil {
+		p.ForeignCurrencies = make(map[string]float64)
+	}
+	if len(p.ForeignCurrencies) == 0 && len(p.ForeignBalances) > 0 {
+		for code, amount := range p.ForeignBalances {
+			p.ForeignCurrencies[code] = float64(amount)
+		}
+	}
+	p.TransferRefs = appendUniqueRefs(p.TransferRefs, p.TransferIDs)
+	p.TransferRefs = appendUniqueRefs(p.TransferRefs, p.TokenTransferIDs)
+}
+
+func normalizeParticipantForWrite(p *Participant, bic string, updatedAt string) {
+	normalizeParticipantForRead(p)
+	if strings.TrimSpace(p.BIC) == "" && strings.TrimSpace(bic) != "" {
+		p.BIC = strings.TrimSpace(strings.ToUpper(bic))
+	}
+	if strings.TrimSpace(updatedAt) != "" {
+		p.LastUpdated = updatedAt
+	}
+	if strings.EqualFold(strings.TrimSpace(p.Status), "ACTIVE") {
+		p.Approved = true
+		if strings.TrimSpace(p.ActivatedAt) == "" && strings.TrimSpace(updatedAt) != "" {
+			p.ActivatedAt = updatedAt
+		}
+	}
+	if strings.TrimSpace(p.ApprovedAt) == "" && strings.TrimSpace(p.ActivatedAt) != "" {
+		p.ApprovedAt = p.ActivatedAt
+	}
+	if strings.TrimSpace(p.CustomerID) == "" {
+		p.CustomerID = strings.TrimSpace(p.CustomerRef)
+	}
+	if strings.TrimSpace(p.KycId) == "" {
+		p.KycId = strings.TrimSpace(p.KycRef)
+	}
+}
+
+func mintRequestStateKey(bic, msgID string) string {
+	return fmt.Sprintf("%s/MINT/%s", strings.TrimSpace(strings.ToUpper(bic)), strings.TrimSpace(msgID))
+}
+
+func registerParticipantStateKey(bic, msgID string) string {
+	return fmt.Sprintf("%s/CREG/%s", strings.TrimSpace(strings.ToUpper(bic)), strings.TrimSpace(msgID))
+}
+
+func isRegisterParticipantRequestKey(key string) bool {
+	return strings.HasPrefix(key, "custreq_") || strings.Contains(key, "/CREG/")
+}
+
+func (s *SmartContract) resolveRegisterParticipantStateKey(ctx contractapi.TransactionContextInterface, requestRef string) (string, error) {
+	requestRef = strings.TrimSpace(requestRef)
+	if requestRef == "" {
+		return "", fmt.Errorf("registration request reference required")
+	}
+	if raw, err := ctx.GetStub().GetState(requestRef); err == nil && raw != nil {
+		return requestRef, nil
+	}
+	legacyKey := fmt.Sprintf("custreq_%s", requestRef)
+	if raw, err := ctx.GetStub().GetState(legacyKey); err == nil && raw != nil {
+		return legacyKey, nil
+	}
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return "", err
+		}
+		if !isRegisterParticipantRequestKey(kv.Key) {
+			continue
+		}
+		var req RegisterParticipantRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		if strings.TrimSpace(req.MsgID) == requestRef {
+			return kv.Key, nil
+		}
+	}
+	return "", fmt.Errorf("registration request %s not found", requestRef)
+}
+
+func (s *SmartContract) getTxUTCTime(ctx contractapi.TransactionContextInterface) (time.Time, error) {
+	ts, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(ts.Seconds, int64(ts.Nanos)).UTC(), nil
+}
+
+func (s *SmartContract) resolveTokenRequestStateKey(ctx contractapi.TransactionContextInterface, requestRef string) (string, error) {
+	requestRef = strings.TrimSpace(requestRef)
+	if requestRef == "" {
+		return "", fmt.Errorf("request reference required")
+	}
+
+	// Exact world-state key lookup first.
+	if raw, err := ctx.GetStub().GetState(requestRef); err == nil && raw != nil {
+		return requestRef, nil
+	}
+
+	// Legacy key format.
+	legacyKey := fmt.Sprintf("tokenrequest_%s", requestRef)
+	if raw, err := ctx.GetStub().GetState(legacyKey); err == nil && raw != nil {
+		return legacyKey, nil
+	}
+
+	// New key format: institution/TRQ/msg_id
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return "", err
+		}
+		if !(strings.HasPrefix(kv.Key, "tokenrequest_") || strings.Contains(kv.Key, "/TRQ/")) {
+			continue
+		}
+		var req TokenRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		if req.MsgID == requestRef || req.RequestID == requestRef {
+			return kv.Key, nil
+		}
+	}
+
+	return "", fmt.Errorf("token request %s not found", requestRef)
+}
+
+func (s *SmartContract) resolveMintRequestStateKey(ctx contractapi.TransactionContextInterface, requestRef string) (string, error) {
+	requestRef = strings.TrimSpace(requestRef)
+	if requestRef == "" {
+		return "", fmt.Errorf("mint request reference required")
+	}
+	if raw, err := ctx.GetStub().GetState(requestRef); err == nil && raw != nil {
+		return requestRef, nil
+	}
+	legacyKey := fmt.Sprintf("mintrequest_%s", requestRef)
+	if raw, err := ctx.GetStub().GetState(legacyKey); err == nil && raw != nil {
+		return legacyKey, nil
+	}
+	legacyCustKey := fmt.Sprintf("custmintreq_%s", requestRef)
+	if raw, err := ctx.GetStub().GetState(legacyCustKey); err == nil && raw != nil {
+		return legacyCustKey, nil
+	}
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return "", err
+		}
+		if !isMintRequestKey(kv.Key) {
+			continue
+		}
+		var req MintRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		if req.MsgID == requestRef {
+			return kv.Key, nil
+		}
+	}
+	return "", fmt.Errorf("mint request %s not found", requestRef)
+}
+
+func (s *SmartContract) getTodayMintTotalForBIC(ctx contractapi.TransactionContextInterface, bic string) (int64, error) {
+	bic = strings.TrimSpace(strings.ToUpper(bic))
+	if bic == "" {
+		return 0, nil
+	}
+	txTime, err := s.getTxUTCTime(ctx)
+	if err != nil {
+		return 0, err
+	}
+	dayPrefix := txTime.Format("2006-01-02")
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+	var total int64
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return 0, err
+		}
+		if !isMintRequestKey(kv.Key) {
+			continue
+		}
+		var req MintRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		if strings.TrimSpace(strings.ToUpper(req.BIC)) != bic {
+			continue
+		}
+		if strings.TrimSpace(req.CreatedAt) == "" || !strings.HasPrefix(req.CreatedAt, dayPrefix) {
+			continue
+		}
+		if isMintRequestPending(req) || isMintRequestApproved(req) {
+			total += req.Amount
+		}
+	}
+	return total, nil
+}
+
+func (s *SmartContract) resolveTokenBIC(ctx contractapi.TransactionContextInterface, token Token) (string, error) {
+	bic := strings.TrimSpace(strings.ToUpper(token.BIC))
+	if validBICFormat(bic) {
+		return bic, nil
+	}
+	display := strings.TrimSpace(strings.ToUpper(token.DisplayTokenID))
+	if validBICFormat(display) {
+		return display, nil
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return "", err
+		}
+		if !(strings.HasPrefix(kv.Key, "tokenrequest_") || strings.Contains(kv.Key, "/TRQ/")) {
+			continue
+		}
+		var req TokenRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		if strings.TrimSpace(req.TokenID) != strings.TrimSpace(token.TokenID) {
+			continue
+		}
+		if strings.ToUpper(strings.TrimSpace(req.Status)) != "APPROVED" {
+			continue
+		}
+		institutionID := strings.TrimSpace(strings.ToUpper(req.InstitutionID))
+		if validBICFormat(institutionID) {
+			return institutionID, nil
+		}
+	}
+
+	// Legacy fallback: older approved requests may not have token_id populated.
+	owner := strings.TrimSpace(token.Owner)
+	if owner != "" {
+		iter2, err := ctx.GetStub().GetStateByRange("", "")
+		if err != nil {
+			return "", err
+		}
+		defer iter2.Close()
+		for iter2.HasNext() {
+			kv, err := iter2.Next()
+			if err != nil {
+				return "", err
+			}
+			if !(strings.HasPrefix(kv.Key, "tokenrequest_") || strings.Contains(kv.Key, "/TRQ/")) {
+				continue
+			}
+			var req TokenRequest
+			if err := json.Unmarshal(kv.Value, &req); err != nil {
+				continue
+			}
+			if strings.ToUpper(strings.TrimSpace(req.Status)) != "APPROVED" {
+				continue
+			}
+			reqOwner := strings.TrimSpace(req.ParticipantAddress)
+			if reqOwner == "" {
+				reqOwner = strings.TrimSpace(req.NetworkAddr)
+			}
+			if reqOwner == "" {
+				reqOwner = strings.TrimSpace(req.CallerID)
+			}
+			if reqOwner != owner {
+				continue
+			}
+			institutionID := strings.TrimSpace(strings.ToUpper(req.InstitutionID))
+			if validBICFormat(institutionID) {
+				return institutionID, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("token BIC is invalid")
+}
+
+// RequestTokenRequest creates a financial-message token request.
+// Args order: institution_id, institution_name, country_code, currency_code, reference
+func (s *SmartContract) RequestTokenRequest(ctx contractapi.TransactionContextInterface, institutionID, institutionName, countryCode, currencyCode, reference string) (string, error) {
+	institutionID = strings.TrimSpace(strings.ToUpper(institutionID))
+	institutionName = strings.TrimSpace(institutionName)
+	countryCode = strings.TrimSpace(strings.ToUpper(countryCode))
+	currencyCode = strings.TrimSpace(strings.ToUpper(currencyCode))
+	reference = strings.TrimSpace(reference)
+
+	if institutionID == "" || !validBICFormat(institutionID) {
+		return "", fmt.Errorf("institution_id must be valid BIC8/BIC11")
+	}
+	if institutionName == "" {
+		return "", fmt.Errorf("institution_name is required")
+	}
+	if !validCountryCode(countryCode) {
+		return "", fmt.Errorf("country_code must be ISO 3166-1 alpha-2")
+	}
+	if !validCurrencyCode(currencyCode) {
+		return "", fmt.Errorf("currency_code must be ISO 4217 format")
+	}
+	if reference == "" {
+		return "", fmt.Errorf("reference is required")
+	}
+
 	callerID, err := ctx.GetClientIdentity().GetID()
 	if err != nil {
-		return fmt.Errorf("failed to get caller identity: %v", err)
+		return "", fmt.Errorf("failed to get caller identity: %v", err)
 	}
 
-	b, err := ctx.GetStub().GetState(networkAddress)
-	if err != nil || b == nil {
-		return fmt.Errorf("participant not found")
+	participantKey := institutionID
+	participantBytes, err := ctx.GetStub().GetState(participantKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to read institution %s: %v", institutionID, err)
 	}
-	var p Participant
-	if err := json.Unmarshal(b, &p); err != nil {
-		return err
+	if participantBytes == nil {
+		// Compatibility path: participants are commonly keyed by caller identity.
+		participantKey = callerID
+		participantBytes, err = ctx.GetStub().GetState(participantKey)
+		if err != nil {
+			return "", fmt.Errorf("failed to read participant by caller identity: %v", err)
+		}
+		if participantBytes == nil {
+			return "", fmt.Errorf("institution %s not registered", institutionID)
+		}
 	}
-
-	// SECURITY FIX #5: Verify caller identity matches participant (not just parameter match)
-	if p.ClientID != callerID {
-		return fmt.Errorf("forbidden: caller identity does not match participant")
+	var participant Participant
+	if err := json.Unmarshal(participantBytes, &participant); err != nil {
+		return "", fmt.Errorf("failed to parse participant: %v", err)
 	}
-
-	// Only validate immutable participant name; ignore country to avoid false mismatches
-	if p.Name != name {
-		return fmt.Errorf("participant details do not match")
+	normalizeParticipantForRead(&participant)
+	if participant.ClientID != callerID {
+		return "", fmt.Errorf("forbidden: caller does not own institution %s", institutionID)
+	}
+	// Institution legal name can differ from wallet username/participant display name.
+	// Keep ownership enforcement via ClientID check above, and only validate country consistency.
+	if strings.TrimSpace(strings.ToUpper(participant.Country)) != "" &&
+		strings.TrimSpace(strings.ToUpper(participant.Country)) != countryCode {
+		return "", fmt.Errorf("institution country does not match registered participant country")
 	}
 
 	client, err := cid.New(ctx.GetStub())
 	if err != nil {
-		return err
-	}
-	callerID, err = client.GetID()
-	if err != nil {
-		return err
+		return "", err
 	}
 	mspID, err := client.GetMSPID()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	txID := ctx.GetStub().GetTxID()
-	reqID := fmt.Sprintf("tokenrequest_%s", txID)
+	shortTx := txID
+	if len(shortTx) > 8 {
+		shortTx = shortTx[:8]
+	}
+	msgID := fmt.Sprintf("%s-tokenrequest_tx%s", institutionID, shortTx)
+
+	txTime, err := s.getTxUTCTime(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to derive transaction time: %v", err)
+	}
+	createdAt := txTime.Format(time.RFC3339)
+	validUntil := txTime.Add(30 * 24 * time.Hour).Format(time.RFC3339)
+	stateKey := fmt.Sprintf("%s/TRQ/%s", institutionID, msgID)
+
+	existing, err := ctx.GetStub().GetState(stateKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to read state: %v", err)
+	}
+	if existing != nil {
+		return "", fmt.Errorf("token request already exists: %s", msgID)
+	}
+
 	req := TokenRequest{
-		RequestID:          reqID,
+		MsgID:              msgID,
+		InstitutionID:      institutionID,
+		InstitutionName:    institutionName,
+		CountryCode:        countryCode,
+		CurrencyCode:       currencyCode,
+		RequestPurpose:     "CURRENCY_ACCESS",
+		Status:             "PENDING",
+		CreatedAt:          createdAt,
+		ValidUntil:         validUntil,
+		Reference:          reference,
+		RequestID:          msgID, // legacy read compatibility
 		NetworkAddr:        callerID,
-		ParticipantAddress: networkAddress,
+		ParticipantAddress: participantKey,
 		CallerID:           callerID,
 		CallerMSP:          mspID,
-		ParticipantMSP:     p.MSP, // Store participant's MSP for validation during approval
-		Status:             "PENDING",
-		TokenID:            "",
-		Currency:           currency,
+		ParticipantMSP:     participant.MSP,
+		Currency:           currencyCode,
 	}
-	rb, _ := json.Marshal(req)
-	return ctx.GetStub().PutState(reqID, rb)
+
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %v", err)
+	}
+	if err := ctx.GetStub().PutState(stateKey, reqBytes); err != nil {
+		return "", err
+	}
+	if err := ctx.GetStub().SetEvent("TokenRequestCreated", []byte(msgID)); err != nil {
+		return "", err
+	}
+
+	response := map[string]string{
+		"msg_id":      msgID,
+		"status":      "PENDING",
+		"state_key":   stateKey,
+		"created_at":  createdAt,
+		"valid_until": validUntil,
+	}
+	resBytes, err := json.Marshal(response)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %v", err)
+	}
+	return string(resBytes), nil
 }
 
 // GetPendingTokenRequests returns admin pending token requests
@@ -979,7 +2167,7 @@ func (s *SmartContract) GetPendingTokenRequests(ctx contractapi.TransactionConte
 		if err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(kv.Key, "tokenrequest_") {
+		if strings.HasPrefix(kv.Key, "tokenrequest_") || strings.Contains(kv.Key, "/TRQ/") {
 			var r TokenRequest
 			if err := json.Unmarshal(kv.Value, &r); err == nil && r.Status == "PENDING" {
 				list = append(list, r)
@@ -1003,7 +2191,11 @@ func (s *SmartContract) ApproveTokenRequest(ctx contractapi.TransactionContextIn
 		return fmt.Errorf("failed to get approver MSP: %v", err)
 	}
 
-	rb, err := ctx.GetStub().GetState(requestID)
+	stateKey, err := s.resolveTokenRequestStateKey(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	rb, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || rb == nil {
 		return fmt.Errorf("token request not found")
 	}
@@ -1018,7 +2210,10 @@ func (s *SmartContract) ApproveTokenRequest(ctx contractapi.TransactionContextIn
 		return fmt.Errorf("access denied: only your bank (%s) can approve your token request (request from: %s)", approverMSP, r.ParticipantMSP)
 	}
 
-	currency := strings.TrimSpace(r.Currency)
+	currency := strings.TrimSpace(r.CurrencyCode)
+	if currency == "" {
+		currency = strings.TrimSpace(r.Currency)
+	}
 	if currency == "" {
 		return fmt.Errorf("token request missing currency")
 	}
@@ -1033,13 +2228,19 @@ func (s *SmartContract) ApproveTokenRequest(ctx contractapi.TransactionContextIn
 
 	r.Status = "APPROVED"
 	r.TokenID = tokenID
+	r.CurrencyCode = currency
+	r.Currency = currency
+	r.ApproverID, _ = ctx.GetClientIdentity().GetID()
 	rb, _ = json.Marshal(r)
 
-	if err = ctx.GetStub().PutState(requestID, rb); err != nil {
+	if err = ctx.GetStub().PutState(stateKey, rb); err != nil {
 		return err
 	}
 
 	targetAddress := r.ParticipantAddress
+	if targetAddress == "" {
+		targetAddress = r.InstitutionID
+	}
 	if targetAddress == "" {
 		targetAddress = r.NetworkAddr
 	}
@@ -1050,6 +2251,7 @@ func (s *SmartContract) ApproveTokenRequest(ctx contractapi.TransactionContextIn
 	}
 	var p Participant
 	json.Unmarshal(pb, &p)
+	normalizeParticipantForRead(&p)
 
 	// Verify participant belongs to approver's bank
 	if p.MSP != approverMSP {
@@ -1058,11 +2260,15 @@ func (s *SmartContract) ApproveTokenRequest(ctx contractapi.TransactionContextIn
 
 	p.TokenID = tokenID
 	p.Approved = true
+	p.Status = "ACTIVE"
 	assignTime, err := s.currentTxTime(ctx)
 	if err != nil {
 		return err
 	}
 	p.ApprovedAt = assignTime
+	p.ActivatedAt = assignTime
+	p.LastUpdated = assignTime
+	normalizeParticipantForWrite(&p, strings.TrimSpace(strings.ToUpper(r.InstitutionID)), assignTime)
 	pb, _ = json.Marshal(p)
 
 	if err = ctx.GetStub().PutState(targetAddress, pb); err != nil {
@@ -1078,6 +2284,11 @@ func (s *SmartContract) ApproveTokenRequest(ctx contractapi.TransactionContextIn
 	t.Owner = targetAddress
 	t.OwnerMSP = approverMSP // Token now belongs to this bank
 	t.Available = false
+	// Use institution ID as stable display identifier for bank-facing UIs.
+	t.DisplayTokenID = strings.TrimSpace(strings.ToUpper(r.InstitutionID))
+	t.BIC = strings.TrimSpace(strings.ToUpper(r.InstitutionID))
+	t.Status = "ACTIVE"
+	t.IsFrozen = false
 	if t.Currency == "" {
 		t.Currency = currency
 	} else if t.Currency != currency {
@@ -1101,7 +2312,11 @@ func (s *SmartContract) CancelTokenRequest(ctx contractapi.TransactionContextInt
 		return fmt.Errorf("failed to get caller MSP: %v", err)
 	}
 
-	rb, err := ctx.GetStub().GetState(requestID)
+	stateKey, err := s.resolveTokenRequestStateKey(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	rb, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || rb == nil {
 		return fmt.Errorf("token request not found")
 	}
@@ -1125,7 +2340,7 @@ func (s *SmartContract) CancelTokenRequest(ctx contractapi.TransactionContextInt
 	r.Status = "CANCELLED"
 	rb, _ = json.Marshal(r)
 
-	return ctx.GetStub().PutState(requestID, rb)
+	return ctx.GetStub().PutState(stateKey, rb)
 }
 
 // findAvailableToken returns first available tokenID or empty string
@@ -1177,11 +2392,25 @@ func (s *SmartContract) GetTokenAccess(ctx contractapi.TransactionContextInterfa
 	return p.TokenID, nil
 }
 
-// RequestMintCoins allows token owner to request minting coins
-// RequestMintCoins verifies participant identity, then stores mint request
-func (s *SmartContract) RequestMintCoins(ctx contractapi.TransactionContextInterface, networkAddress string, amount int) error {
-	// Fetch participant information by network address
-	partBytes, err := ctx.GetStub().GetState(networkAddress)
+// RequestTokenMint creates a mint request using caller certificate context only.
+func (s *SmartContract) RequestTokenMint(ctx contractapi.TransactionContextInterface, amount int64, purpose string) error {
+	if amount <= 0 || amount > maxMintRequestAmount {
+		return fmt.Errorf("amount must be 1-100000000")
+	}
+	if !validMintPurpose(purpose) {
+		return fmt.Errorf("purpose must be one of WORKING_CAPITAL, SETTLEMENT, LIQUIDITY")
+	}
+
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return fmt.Errorf("failed to verify identity: %v", err)
+	}
+	callerMSP, err := s.GetCallerMSP(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get bank MSP: %v", err)
+	}
+
+	partBytes, err := ctx.GetStub().GetState(callerID)
 	if err != nil || partBytes == nil {
 		return fmt.Errorf("participant not found")
 	}
@@ -1189,30 +2418,13 @@ func (s *SmartContract) RequestMintCoins(ctx contractapi.TransactionContextInter
 	if err := json.Unmarshal(partBytes, &participant); err != nil {
 		return err
 	}
-
-	// DATA ISOLATION: Verify caller's bank matches participant's bank
-	callerMSP, err := s.GetCallerMSP(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get caller MSP: %v", err)
+	if strings.TrimSpace(participant.TokenID) == "" {
+		return fmt.Errorf("participant has no assigned token")
 	}
 	if err := s.VerifyBankAccessToData(ctx, participant.MSP); err != nil {
 		return err
 	}
 
-	// SECURITY: Verify caller identity matches participant client ID (3-layer defense)
-	callerID, err := ctx.GetClientIdentity().GetID()
-	if err != nil {
-		return err
-	}
-	if participant.ClientID != callerID {
-		return fmt.Errorf("forbidden: caller identity does not match participant")
-	}
-	// Additional verification: participant must own a token
-	if participant.TokenID == "" {
-		return fmt.Errorf("participant has no assigned token")
-	}
-
-	// Check token ownership (redundancy check)
 	tokenBytes, err := ctx.GetStub().GetState(participant.TokenID)
 	if err != nil || tokenBytes == nil {
 		return fmt.Errorf("token not found")
@@ -1221,36 +2433,81 @@ func (s *SmartContract) RequestMintCoins(ctx contractapi.TransactionContextInter
 	if err := json.Unmarshal(tokenBytes, &token); err != nil {
 		return err
 	}
-	if token.Owner != networkAddress {
+	if token.Owner != participant.NetworkAddress {
 		return fmt.Errorf("caller is not token owner")
 	}
-	// VERIFY: Only token owner's bank can request mints
 	if token.OwnerMSP != callerMSP {
 		return fmt.Errorf("access denied: only token owner's bank can request mints")
 	}
-	tokenCurrency := strings.TrimSpace(token.Currency)
-	if tokenCurrency == "" {
+	if strings.EqualFold(strings.TrimSpace(token.Status), "FROZEN") || token.IsFrozen {
+		return fmt.Errorf("token %s is frozen", token.TokenID)
+	}
+	tokenCurrency := strings.TrimSpace(strings.ToUpper(token.Currency))
+	if !validCurrencyCode(tokenCurrency) {
 		return fmt.Errorf("token currency not configured")
 	}
-
-	// Create mint request ID unique per transaction similar to token requests
-	txID := ctx.GetStub().GetTxID()
-	reqKey := fmt.Sprintf("mintrequest_%s", txID)
-	mintReq := MintRequest{
-		RequestID:   reqKey,
-		TokenID:     participant.TokenID,
-		RequestedBy: networkAddress,
-		Amount:      amount,
-		Approved:    false,
-		Currency:    tokenCurrency,
-	}
-	reqBytes, err := json.Marshal(mintReq)
+	bic, err := s.resolveTokenBIC(ctx, token)
 	if err != nil {
 		return err
 	}
+	if bic != token.BIC {
+		token.BIC = bic
+		updatedTokenBytes, marshalErr := json.Marshal(token)
+		if marshalErr == nil {
+			_ = ctx.GetStub().PutState(token.TokenID, updatedTokenBytes)
+		}
+	}
 
-	// Store the mint request on ledger
-	return ctx.GetStub().PutState(reqKey, reqBytes)
+	todayTotal, err := s.getTodayMintTotalForBIC(ctx, bic)
+	if err != nil {
+		return err
+	}
+	if todayTotal+amount > maxMintRequestAmount {
+		return fmt.Errorf("daily cap exceeded for %s", bic)
+	}
+
+	txID := ctx.GetStub().GetTxID()
+	shortTx := txID
+	if len(shortTx) > 8 {
+		shortTx = shortTx[:8]
+	}
+	msgID := fmt.Sprintf("%s-MINT-%s", bic, shortTx)
+	txTime, err := s.getTxUTCTime(ctx)
+	if err != nil {
+		return err
+	}
+	req := MintRequest{
+		MsgID:          msgID,
+		BIC:            bic,
+		TokenID:        token.TokenID,
+		Amount:         amount,
+		Currency:       tokenCurrency,
+		KycRef:         strings.TrimSpace(participant.KycId),
+		KycStatus:      "VERIFIED",
+		Status:         "PENDING",
+		CreatedAt:      txTime.Format(time.RFC3339),
+		ExpiresAt:      txTime.Add(mintRequestTTLDays * 24 * time.Hour).Format(time.RFC3339),
+		Purpose:        strings.TrimSpace(strings.ToUpper(purpose)),
+		DailyLimitUsed: todayTotal + amount,
+	}
+	setMintRequestCustomerRef(&req, callerID)
+
+	stateKey := mintRequestStateKey(bic, msgID)
+	if existing, err := ctx.GetStub().GetState(stateKey); err != nil {
+		return err
+	} else if existing != nil {
+		return fmt.Errorf("mint request already exists: %s", msgID)
+	}
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(stateKey, reqBytes)
+}
+
+// RequestMintCoins keeps backward compatibility with existing client payloads.
+func (s *SmartContract) RequestMintCoins(ctx contractapi.TransactionContextInterface, _networkAddress string, amount int) error {
+	return s.RequestTokenMint(ctx, int64(amount), mintPurposeWorkingCapital)
 }
 
 // GetPendingMintRequests (admin)
@@ -1272,9 +2529,9 @@ func (s *SmartContract) GetPendingMintRequests(ctx contractapi.TransactionContex
 	var reqs []MintRequest
 	for it.HasNext() {
 		kv, _ := it.Next()
-		if strings.HasPrefix(kv.Key, "mintrequest_") {
+		if isMintRequestKey(kv.Key) {
 			var r MintRequest
-			if json.Unmarshal(kv.Value, &r) == nil && !r.Approved {
+			if json.Unmarshal(kv.Value, &r) == nil && isMintRequestPending(r) {
 				// Fetch token to check ownership MSP
 				tokenBytes, tErr := ctx.GetStub().GetState(r.TokenID)
 				if tErr != nil || tokenBytes == nil {
@@ -1317,14 +2574,14 @@ func (s *SmartContract) GetApprovedMintRequests(ctx contractapi.TransactionConte
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "mintrequest_") {
+		if !isMintRequestKey(kv.Key) {
 			continue
 		}
 		var req MintRequest
 		if err := json.Unmarshal(kv.Value, &req); err != nil {
 			continue
 		}
-		if req.Approved {
+		if isMintRequestApproved(req) {
 			// Fetch token to check ownership MSP
 			tokenBytes, tErr := ctx.GetStub().GetState(req.TokenID)
 			if tErr != nil || tokenBytes == nil {
@@ -1353,6 +2610,7 @@ func (s *SmartContract) ListApprovedParticipantMintRequests(ctx contractapi.Tran
 	if err := json.Unmarshal(pb, &participant); err != nil {
 		return nil, err
 	}
+	normalizeParticipantForRead(&participant)
 	// Verify caller's MSP matches participant's MSP (bank-level access)
 	callerMSP, err := s.GetCallerMSP(ctx)
 	if err != nil {
@@ -1374,14 +2632,15 @@ func (s *SmartContract) ListApprovedParticipantMintRequests(ctx contractapi.Tran
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "mintrequest_") {
+		if !isMintRequestKey(kv.Key) {
 			continue
 		}
 		var req MintRequest
 		if err := json.Unmarshal(kv.Value, &req); err != nil {
 			continue
 		}
-		if req.RequestedBy == networkAddress && req.Approved {
+		reqCustomerRef := mintRequestCustomerRef(req)
+		if isMintRequestApproved(req) && (reqCustomerRef == networkAddress || reqCustomerRef == participant.CustomerID || reqCustomerRef == participant.CustomerRef) {
 			approved = append(approved, req)
 		}
 	}
@@ -1399,8 +2658,16 @@ func (s *SmartContract) ApproveMintRequest(ctx contractapi.TransactionContextInt
 	if err != nil {
 		return fmt.Errorf("failed to get approver MSP: %v", err)
 	}
+	approverID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return fmt.Errorf("failed to get approver identity: %v", err)
+	}
 
-	reqBytes, err := ctx.GetStub().GetState(requestID)
+	stateKey, err := s.resolveMintRequestStateKey(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || reqBytes == nil {
 		return fmt.Errorf("mint request not found")
 	}
@@ -1410,7 +2677,7 @@ func (s *SmartContract) ApproveMintRequest(ctx contractapi.TransactionContextInt
 		return err
 	}
 
-	if mr.Approved {
+	if isMintRequestApproved(mr) {
 		return fmt.Errorf("mint request already approved")
 	}
 
@@ -1442,23 +2709,70 @@ func (s *SmartContract) ApproveMintRequest(ctx contractapi.TransactionContextInt
 	if err != nil {
 		return err
 	}
-	mr.Approved = true
-	mr.ApprovedAt = ts
+	mr.Status = "APPROVED"
+	if strings.TrimSpace(mr.CreatedAt) == "" {
+		mr.CreatedAt = ts
+	}
 	updatedReqBytes, err := json.Marshal(mr)
 	if err != nil {
 		return err
 	}
 
-	if err = ctx.GetStub().PutState(requestID, updatedReqBytes); err != nil {
+	if err = ctx.GetStub().PutState(stateKey, updatedReqBytes); err != nil {
 		return err
 	}
-	token.Minted += mr.Amount
+	setTokenSupply(&token, getTokenSupply(token)+int(mr.Amount))
 	updatedTokenBytes, err := json.Marshal(token)
 	if err != nil {
 		return err
 	}
 
-	return ctx.GetStub().PutState(mr.TokenID, updatedTokenBytes)
+	if err := ctx.GetStub().PutState(mr.TokenID, updatedTokenBytes); err != nil {
+		return err
+	}
+
+	bic := strings.TrimSpace(strings.ToUpper(token.BIC))
+	if bic == "" {
+		resolvedBIC, bicErr := s.resolveTokenBIC(ctx, token)
+		if bicErr == nil {
+			bic = strings.TrimSpace(strings.ToUpper(resolvedBIC))
+		}
+	}
+	if bic == "" {
+		bic = "UNKNOWNBIC"
+	}
+
+	recordID := fmt.Sprintf("%s-TMINT-%s", bic, strings.TrimSpace(requestID))
+	tokenMintRecord := TokenMintRecord{
+		RecordID:     recordID,
+		MsgID:        mr.MsgID,
+		RequestID:    strings.TrimSpace(requestID),
+		BIC:          bic,
+		TokenID:      mr.TokenID,
+		Amount:       mr.Amount,
+		Currency:     strings.TrimSpace(mr.Currency),
+		Purpose:      strings.TrimSpace(mr.Purpose),
+		Status:       "APPROVED",
+		CreatedAt:    strings.TrimSpace(mr.CreatedAt),
+		ApprovedAt:   ts,
+		ApprovedBy:   approverID,
+		CustomerRef:  strings.TrimSpace(mr.CustomerRef),
+		CustomerID:   strings.TrimSpace(mr.CustomerID),
+		MintCategory: "TOKEN_OWNER_MINT",
+	}
+	recordBytes, err := json.Marshal(tokenMintRecord)
+	if err != nil {
+		return err
+	}
+	if err := ctx.GetStub().PutState(tokenMintRecordStateKey(bic, recordID), recordBytes); err != nil {
+		return err
+	}
+	// Legacy lookup key for compatibility.
+	if err := ctx.GetStub().PutState("tokenmint_"+recordID, recordBytes); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (s *SmartContract) GetWalletInfo(ctx contractapi.TransactionContextInterface, networkAddress string) (map[string]interface{}, error) {
@@ -1537,13 +2851,15 @@ func (s *SmartContract) GetWalletInfo(ctx contractapi.TransactionContextInterfac
 			foreignHoldings = append(foreignHoldings, entry)
 		}
 	}
-	availableBalanceValue := float64(t.Minted)
+	availableBalanceValue := float64(getTokenSupply(t))
 	availableDisplay := formatCurrencyValue(t.Currency, availableBalanceValue)
 	walletDisplay := formatCurrencyValue(t.Currency, walletBalance)
 
 	return map[string]interface{}{
 		"networkAddress":          p.NetworkAddress,
 		"tokenID":                 t.TokenID,
+		"bic":                     strings.TrimSpace(strings.ToUpper(t.BIC)),
+		"bic_code":                strings.TrimSpace(strings.ToUpper(t.BIC)),
 		"currency":                t.Currency,
 		"currencySymbol":          currencySymbol(t.Currency),
 		"availableBalance":        availableBalanceValue,
@@ -1820,6 +3136,63 @@ func (s *SmartContract) ListAssignedTokens(ctx contractapi.TransactionContextInt
 	return assigned, nil
 }
 
+// ListAssignedTokensByOwner returns only tokens owned by the provided owner network address.
+// This is stricter than ListAssignedTokens and is intended for owner-scoped dashboards.
+func (s *SmartContract) ListAssignedTokensByOwner(ctx contractapi.TransactionContextInterface, ownerNetworkAddress string) ([]Token, error) {
+	trimmedOwner := strings.TrimSpace(ownerNetworkAddress)
+	if trimmedOwner == "" {
+		return nil, fmt.Errorf("owner network address is required")
+	}
+
+	callerMSP, err := s.GetCallerMSP(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get caller MSP: %v", err)
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var assigned []Token
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(kv.Key, "token_") {
+			continue
+		}
+
+		var token Token
+		if err := json.Unmarshal(kv.Value, &token); err != nil {
+			continue
+		}
+
+		// Enforce both exact owner match and bank isolation.
+		if token.Owner != trimmedOwner {
+			continue
+		}
+		if token.OwnerMSP != callerMSP {
+			continue
+		}
+
+		if token.TokenID == "" {
+			token.TokenID = kv.Key
+		}
+		if token.TransferIDs == nil {
+			token.TransferIDs = []string{}
+		}
+		if token.ForeignBalances == nil {
+			token.ForeignBalances = make(map[string]int)
+		}
+		assigned = append(assigned, token)
+	}
+
+	return assigned, nil
+}
+
 // ListApprovedParticipants returns all approved participants, filtered by caller's owned tokens only
 func (s *SmartContract) ListApprovedParticipants(ctx contractapi.TransactionContextInterface) ([]Participant, error) {
 	if err := s.VerifyAdmin(ctx); err != nil {
@@ -1888,6 +3261,7 @@ func (s *SmartContract) ListApprovedParticipants(ctx contractapi.TransactionCont
 		if err := json.Unmarshal(pBytes, &participant); err != nil {
 			continue
 		}
+		normalizeParticipantForRead(&participant)
 		if !participant.Approved {
 			continue
 		}
@@ -1902,6 +3276,8 @@ func (s *SmartContract) ListApprovedParticipants(ctx contractapi.TransactionCont
 		if participant.TransferIDs == nil {
 			participant.TransferIDs = []string{}
 		}
+		participant.TransferRefs = appendUniqueRefs(participant.TransferRefs, participant.TransferIDs)
+		participant.TransferRefs = appendUniqueRefs(participant.TransferRefs, participant.TokenTransferIDs)
 		approved = append(approved, participant)
 	}
 	return approved, nil
@@ -1929,6 +3305,7 @@ func (s *SmartContract) RegisterCustomer(ctx contractapi.TransactionContextInter
 	if err := json.Unmarshal(partBytes, &participant); err != nil {
 		return fmt.Errorf("invalid participant record: %w", err)
 	}
+	normalizeParticipantForRead(&participant)
 	// Caller must be registering as themselves
 	if participant.ClientID != callerID {
 		return fmt.Errorf("forbidden: can only register yourself")
@@ -1963,27 +3340,33 @@ func (s *SmartContract) RegisterCustomer(ctx contractapi.TransactionContextInter
 
 	// Build request id per transaction similar to other requests
 	txID := ctx.GetStub().GetTxID()
-	reqID := fmt.Sprintf("custreq_%s", txID)
-
-	clientID := callerID
-
+	shortTx := txID
+	if len(shortTx) > 8 {
+		shortTx = shortTx[:8]
+	}
+	bic, err := s.resolveTokenBIC(ctx, token)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	msgID := fmt.Sprintf("%s-CREG-%s", bic, shortTx)
 	req := RegisterParticipantRequest{
-		RequestID:      reqID,
-		NetworkAddress: networkAddress,
-		Name:           name,
-		ClientID:       clientID,
-		TokenID:        tokenID,
-		Approved:       false,
-		KycId:          kycId,
-		KycStatus:      kycStatus,
-		CreatedAt:      time.Now().Format(time.RFC3339), // SECURITY FIX: Track creation time for expiration
-		Status:         "PENDING",                       // SECURITY FIX: Track request status
+		MsgID:       msgID,
+		BIC:         bic,
+		TokenID:     tokenID,
+		CustomerRef: networkAddress,
+		KycRef:      kycId,
+		KycStatus:   kycStatus,
+		Status:      "PENDING",
+		Purpose:     "CUSTOMER_REGISTRATION",
+		CreatedAt:   now.Format(time.RFC3339),
+		ExpiresAt:   now.Add(30 * 24 * time.Hour).Format(time.RFC3339),
 	}
 	requestBytes, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}
-	return ctx.GetStub().PutState(reqID, requestBytes)
+	return ctx.GetStub().PutState(registerParticipantStateKey(bic, msgID), requestBytes)
 }
 
 // Token owner views pending customer registrations for their token
@@ -2027,9 +3410,9 @@ func (s *SmartContract) ViewPendingCustomerRegistrations(ctx contractapi.Transac
 		if err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(kv.Key, "custreq_") {
+		if isRegisterParticipantRequestKey(kv.Key) {
 			var req RegisterParticipantRequest
-			if err := json.Unmarshal(kv.Value, &req); err == nil && req.TokenID == tokenID && !req.Approved {
+			if err := json.Unmarshal(kv.Value, &req); err == nil && req.TokenID == tokenID && strings.ToUpper(strings.TrimSpace(req.Status)) == "PENDING" {
 				pendingRequests = append(pendingRequests, req)
 			}
 		}
@@ -2054,7 +3437,11 @@ func (s *SmartContract) ApproveCustomerRegistration(ctx contractapi.TransactionC
 		return fmt.Errorf("forbidden: caller identity does not match owner")
 	}
 
-	reqBytes, err := ctx.GetStub().GetState(requestID)
+	stateKey, err := s.resolveRegisterParticipantStateKey(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || reqBytes == nil {
 		return fmt.Errorf("customer registration request not found")
 	}
@@ -2086,7 +3473,7 @@ func (s *SmartContract) ApproveCustomerRegistration(ctx contractapi.TransactionC
 		return fmt.Errorf("access denied: only token owner's bank can approve customers")
 	}
 
-	if req.Approved {
+	if strings.ToUpper(strings.TrimSpace(req.Status)) == "APPROVED" {
 		return fmt.Errorf("already approved")
 	}
 
@@ -2107,20 +3494,16 @@ func (s *SmartContract) ApproveCustomerRegistration(ctx contractapi.TransactionC
 	req.KycStatus = "verified"
 
 	// SECURITY FIX #7: Check request timestamp is not too old (older than 30 days)
-	req.CreatedAt = strings.TrimSpace(req.CreatedAt)
-	if req.CreatedAt != "" {
-		createdTime, err := time.Parse(time.RFC3339, req.CreatedAt)
-		if err == nil {
-			elapsedDays := time.Since(createdTime).Hours() / 24
-			if elapsedDays > 30 {
-				return fmt.Errorf("registration request expired (created %v days ago, max 30 days)", int(elapsedDays))
-			}
+	req.ExpiresAt = strings.TrimSpace(req.ExpiresAt)
+	if req.ExpiresAt != "" {
+		expiryTime, err := time.Parse(time.RFC3339, req.ExpiresAt)
+		if err == nil && time.Now().UTC().After(expiryTime) {
+			return fmt.Errorf("registration request expired at %s", req.ExpiresAt)
 		}
 	}
-	req.Approved = true
 	req.Status = "APPROVED"
 	updatedReqBytes, _ := json.Marshal(req)
-	if err := ctx.GetStub().PutState(requestID, updatedReqBytes); err != nil {
+	if err := ctx.GetStub().PutState(stateKey, updatedReqBytes); err != nil {
 		return err
 	}
 
@@ -2129,9 +3512,14 @@ func (s *SmartContract) ApproveCustomerRegistration(ctx contractapi.TransactionC
 	if err == nil && participantBytes != nil {
 		var participant Participant
 		if err := json.Unmarshal(participantBytes, &participant); err == nil {
-			participant.KycId = req.KycId
+			normalizeParticipantForRead(&participant)
+			participant.KycId = req.KycRef
+			participant.KycRef = req.KycRef
 			participant.KycStatus = req.KycStatus
 			participant.Approved = true // Mark participant as approved
+			participant.Status = "ACTIVE"
+			participant.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+			normalizeParticipantForWrite(&participant, strings.TrimSpace(token.BIC), participant.LastUpdated)
 			if updatedParticipantBytes, err := json.Marshal(participant); err == nil {
 				ctx.GetStub().PutState(ownerNetworkAddress, updatedParticipantBytes)
 			}
@@ -2144,19 +3532,28 @@ func (s *SmartContract) ApproveCustomerRegistration(ctx contractapi.TransactionC
 	}
 
 	participant := Participant{
+		CustomerRef:       req.CustomerRef,
+		KycRef:            req.KycRef,
 		CustomerID:        customerID,
-		NetworkAddress:    req.NetworkAddress,
-		Name:              req.Name,
-		ClientID:          req.ClientID,
+		NetworkAddress:    req.CustomerRef,
+		Name:              req.CustomerRef,
+		ClientID:          req.CustomerRef,
+		BIC:               strings.TrimSpace(strings.ToUpper(token.BIC)),
 		TokenID:           req.TokenID,
-		KycId:             req.KycId,
+		KycId:             req.KycRef,
 		KycStatus:         req.KycStatus,
 		Approved:          true,
+		Status:            "ACTIVE",
+		ActivatedAt:       time.Now().UTC().Format(time.RFC3339),
+		LastUpdated:       time.Now().UTC().Format(time.RFC3339),
 		Balance:           0,
+		ForeignBalances:   make(map[string]int64),
 		TransferIDs:       []string{},
+		TransferRefs:      []string{},
 		TokenTransferIDs:  []string{},
 		ForeignCurrencies: make(map[string]float64),
 	}
+	normalizeParticipantForWrite(&participant, token.BIC, participant.LastUpdated)
 	participantBytes, err = json.Marshal(participant)
 	if err != nil {
 		return err
@@ -2165,7 +3562,7 @@ func (s *SmartContract) ApproveCustomerRegistration(ctx contractapi.TransactionC
 	if err := ctx.GetStub().PutState(participantKey, participantBytes); err != nil {
 		return err
 	}
-	if err := ctx.GetStub().PutState(participantNetworkTokenIndexKey(req.NetworkAddress, req.TokenID), []byte(customerID)); err != nil {
+	if err := ctx.GetStub().PutState(participantNetworkTokenIndexKey(req.CustomerRef, req.TokenID), []byte(customerID)); err != nil {
 		return err
 	}
 	if err := ctx.GetStub().PutState(customerIDUniqueKey(customerID), []byte(participantKey)); err != nil {
@@ -2177,22 +3574,89 @@ func (s *SmartContract) ApproveCustomerRegistration(ctx contractapi.TransactionC
 
 	// IMPORTANT: Also create an approved mint request entry so the customer appears in ListApprovedCustomerMintRequests
 	// This ensures the approved customer is visible in /bank/participants/approved endpoint
-	mintRequestID := "custmintreq_" + req.NetworkAddress + "_" + req.TokenID
+	msgID := fmt.Sprintf("%s-MINT-REG-%s", strings.ToUpper(strings.TrimSpace(token.BIC)), customerID)
+	mintStateKey := mintRequestStateKey(token.BIC, msgID)
+	now := time.Now().UTC()
 	approvedMintRequest := MintRequest{
-		RequestID:   mintRequestID,
-		TokenID:     req.TokenID,
-		CustomerID:  customerID,
-		RequestedBy: req.NetworkAddress,
-		Amount:      0, // Initial balance is 0, customer can request mint later
-		Name:        req.Name,
-		KycId:       req.KycId,
-		KycStatus:   req.KycStatus,
-		Approved:    true, // Mark as approved immediately upon customer registration approval
-		ApprovedAt:  time.Now().Format(time.RFC3339),
-		Currency:    "", // Will be set when customer requests mint
+		MsgID:          msgID,
+		BIC:            strings.ToUpper(strings.TrimSpace(token.BIC)),
+		TokenID:        req.TokenID,
+		Amount:         0, // Initial balance is 0, customer can request mint later
+		Currency:       strings.ToUpper(strings.TrimSpace(token.Currency)),
+		KycRef:         req.KycRef,
+		KycStatus:      strings.ToUpper(strings.TrimSpace(req.KycStatus)),
+		Status:         "APPROVED", // Mark as approved immediately upon customer registration approval
+		CreatedAt:      now.Format(time.RFC3339),
+		ApprovedAt:     now.Format(time.RFC3339),
+		ExpiresAt:      now.Add(mintRequestTTLDays * 24 * time.Hour).Format(time.RFC3339),
+		Purpose:        mintPurposeWorkingCapital,
+		DailyLimitUsed: 0,
 	}
+	setMintRequestCustomerRef(&approvedMintRequest, customerID)
 	mintReqBytes, _ := json.Marshal(approvedMintRequest)
-	return ctx.GetStub().PutState(mintRequestID, mintReqBytes)
+	return ctx.GetStub().PutState(mintStateKey, mintReqBytes)
+}
+
+// Token owner rejects customer registration.
+func (s *SmartContract) RejectCustomerRegistration(ctx contractapi.TransactionContextInterface, requestID, ownerNetworkAddress string) error {
+	callerMSP, err := s.GetCallerMSP(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get caller MSP: %v", err)
+	}
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return fmt.Errorf("failed to get caller identity: %v", err)
+	}
+	if callerID != ownerNetworkAddress {
+		return fmt.Errorf("forbidden: caller identity does not match owner")
+	}
+
+	stateKey, err := s.resolveRegisterParticipantStateKey(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
+	if err != nil || reqBytes == nil {
+		return fmt.Errorf("customer registration request not found")
+	}
+	var req RegisterParticipantRequest
+	if err := json.Unmarshal(reqBytes, &req); err != nil {
+		return err
+	}
+
+	if err := s.VerifyBankOwner(ctx, req.TokenID); err != nil {
+		return fmt.Errorf("forbidden: %v", err)
+	}
+
+	tokenBytes, err := ctx.GetStub().GetState(req.TokenID)
+	if err != nil || tokenBytes == nil {
+		return fmt.Errorf("token not found")
+	}
+	var token Token
+	if err := json.Unmarshal(tokenBytes, &token); err != nil {
+		return err
+	}
+	if token.Owner != ownerNetworkAddress {
+		return fmt.Errorf("caller is not token owner")
+	}
+	if token.OwnerMSP != callerMSP {
+		return fmt.Errorf("access denied: only token owner's bank can reject customers")
+	}
+
+	currentStatus := strings.ToUpper(strings.TrimSpace(req.Status))
+	if currentStatus == "APPROVED" {
+		return fmt.Errorf("cannot reject an already approved registration")
+	}
+	if currentStatus == "REJECTED" {
+		return fmt.Errorf("registration already rejected")
+	}
+
+	req.Status = "REJECTED"
+	updatedReqBytes, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(stateKey, updatedReqBytes)
 }
 
 // ListApprovedCustomers returns all approved customers for a given token/owner pair.
@@ -2233,6 +3697,7 @@ func (s *SmartContract) ListApprovedCustomers(ctx contractapi.TransactionContext
 		if err := json.Unmarshal(kv.Value, &cust); err != nil {
 			continue
 		}
+		normalizeParticipantForRead(&cust)
 		if cust.TokenID != tokenID || !cust.Approved {
 			continue
 		}
@@ -2245,6 +3710,8 @@ func (s *SmartContract) ListApprovedCustomers(ctx contractapi.TransactionContext
 		if cust.ForeignCurrencies == nil {
 			cust.ForeignCurrencies = make(map[string]float64)
 		}
+		cust.TransferRefs = appendUniqueRefs(cust.TransferRefs, cust.TransferIDs)
+		cust.TransferRefs = appendUniqueRefs(cust.TransferRefs, cust.TokenTransferIDs)
 		approvedCustomers = append(approvedCustomers, cust)
 	}
 	return approvedCustomers, nil
@@ -2280,6 +3747,7 @@ func (s *SmartContract) ListAllApprovedCustomers(ctx contractapi.TransactionCont
 		if err := json.Unmarshal(kv.Value, &cust); err != nil {
 			continue
 		}
+		normalizeParticipantForRead(&cust)
 		if !cust.Approved {
 			continue
 		}
@@ -2296,6 +3764,8 @@ func (s *SmartContract) ListAllApprovedCustomers(ctx contractapi.TransactionCont
 		if cust.ForeignCurrencies == nil {
 			cust.ForeignCurrencies = make(map[string]float64)
 		}
+		cust.TransferRefs = appendUniqueRefs(cust.TransferRefs, cust.TransferIDs)
+		cust.TransferRefs = appendUniqueRefs(cust.TransferRefs, cust.TokenTransferIDs)
 		approvedCustomers = append(approvedCustomers, cust)
 	}
 	return approvedCustomers, nil
@@ -2353,6 +3823,7 @@ func (s *SmartContract) UpdateCustomerKYC(ctx contractapi.TransactionContextInte
 
 	if strings.TrimSpace(kycID) != "" {
 		customer.KycId = strings.TrimSpace(kycID)
+		customer.KycRef = customer.KycId
 	}
 	if approved {
 		customer.KycStatus = "approved"
@@ -2361,7 +3832,13 @@ func (s *SmartContract) UpdateCustomerKYC(ctx contractapi.TransactionContextInte
 	}
 	if approved && !customer.Approved {
 		customer.Approved = true
+		customer.Status = "ACTIVE"
+		customer.ActivatedAt = time.Now().UTC().Format(time.RFC3339)
+	} else if strings.TrimSpace(customer.Status) == "" {
+		customer.Status = "PENDING"
 	}
+	customer.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+	normalizeParticipantForWrite(customer, token.BIC, customer.LastUpdated)
 
 	updatedBytes, err := json.Marshal(customer)
 	if err != nil {
@@ -2410,17 +3887,23 @@ func (s *SmartContract) UpsertCustomerFromBank(ctx contractapi.TransactionContex
 	var customerValue Participant
 	if lookupErr == nil && customer != nil {
 		customerValue = *customer
+		normalizeParticipantForRead(&customerValue)
 	} else {
 		customerID := generateTokenScopedCustomerID(trimmedToken, ctx.GetStub().GetTxID())
 		if err := ensureCustomerIDUnique(ctx, customerID); err != nil {
 			return err
 		}
 		customerValue = Participant{
+			CustomerRef:       trimmedNetwork,
 			CustomerID:        customerID,
 			NetworkAddress:    trimmedNetwork,
+			BIC:               strings.TrimSpace(strings.ToUpper(token.BIC)),
 			TokenID:           trimmedToken,
+			Status:            "PENDING",
 			TransferIDs:       []string{},
+			TransferRefs:      []string{},
 			TokenTransferIDs:  []string{},
+			ForeignBalances:   make(map[string]int64),
 			ForeignCurrencies: make(map[string]float64),
 		}
 		customerKey = participantStateKeyByCustomerID(customerID)
@@ -2463,6 +3946,7 @@ func (s *SmartContract) UpsertCustomerFromBank(ctx contractapi.TransactionContex
 	}
 	if strings.TrimSpace(kycID) != "" {
 		customerValue.KycId = strings.TrimSpace(kycID)
+		customerValue.KycRef = customerValue.KycId
 	}
 
 	if approved {
@@ -2472,7 +3956,13 @@ func (s *SmartContract) UpsertCustomerFromBank(ctx contractapi.TransactionContex
 	}
 	if approved {
 		customerValue.Approved = true
+		customerValue.Status = "ACTIVE"
+		customerValue.ActivatedAt = time.Now().UTC().Format(time.RFC3339)
+	} else if strings.TrimSpace(customerValue.Status) == "" {
+		customerValue.Status = "PENDING"
 	}
+	customerValue.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+	normalizeParticipantForWrite(&customerValue, token.BIC, customerValue.LastUpdated)
 
 	updatedBytes, err := json.Marshal(customerValue)
 	if err != nil {
@@ -2551,24 +4041,59 @@ func (s *SmartContract) CustomerRequestMint(ctx contractapi.TransactionContextIn
 	if tokenCurrency == "" {
 		return fmt.Errorf("token currency not configured")
 	}
+	if strings.EqualFold(strings.TrimSpace(token.Status), "FROZEN") || token.IsFrozen {
+		return fmt.Errorf("token %s is frozen", token.TokenID)
+	}
+	bic, err := s.resolveTokenBIC(ctx, token)
+	if err != nil {
+		return err
+	}
+	if bic != token.BIC {
+		token.BIC = bic
+		updatedTokenBytes, marshalErr := json.Marshal(token)
+		if marshalErr == nil {
+			_ = ctx.GetStub().PutState(token.TokenID, updatedTokenBytes)
+		}
+	}
+	todayTotal, err := s.getTodayMintTotalForBIC(ctx, bic)
+	if err != nil {
+		return err
+	}
+	if todayTotal+int64(amount) > maxMintRequestAmount {
+		return fmt.Errorf("daily cap exceeded for %s", bic)
+	}
 
 	// Create mint request ID using the current transaction
 	txID := ctx.GetStub().GetTxID()
-	requestID := fmt.Sprintf("custmintreq_%s", txID)
+	shortTx := txID
+	if len(shortTx) > 8 {
+		shortTx = shortTx[:8]
+	}
+	msgID := fmt.Sprintf("%s-MINT-%s", bic, shortTx)
+	txTime, err := s.getTxUTCTime(ctx)
+	if err != nil {
+		return err
+	}
 	mintReq := MintRequest{
-		RequestID:   requestID,
-		TokenID:     tokenID,
-		CustomerID:  customer.CustomerID,
-		RequestedBy: customer.NetworkAddress,
-		Name:        customer.Name,
-		KycId:       customer.KycId,
-		KycStatus:   fmt.Sprintf("%v", customer.KycStatus),
-		Amount:      amount,
-		Approved:    false,
-		Currency:    tokenCurrency,
+		MsgID:          msgID,
+		BIC:            bic,
+		TokenID:        tokenID,
+		Amount:         int64(amount),
+		Currency:       tokenCurrency,
+		KycRef:         strings.TrimSpace(customer.KycId),
+		KycStatus:      strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", customer.KycStatus))),
+		Status:         "PENDING",
+		CreatedAt:      txTime.Format(time.RFC3339),
+		ExpiresAt:      txTime.Add(mintRequestTTLDays * 24 * time.Hour).Format(time.RFC3339),
+		Purpose:        mintPurposeWorkingCapital,
+		DailyLimitUsed: todayTotal + int64(amount),
+	}
+	setMintRequestCustomerRef(&mintReq, customer.CustomerID)
+	if mintReq.KycStatus == "" {
+		mintReq.KycStatus = "VERIFIED"
 	}
 	reqBytes, _ := json.Marshal(mintReq)
-	return ctx.GetStub().PutState(requestID, reqBytes)
+	return ctx.GetStub().PutState(mintRequestStateKey(bic, msgID), reqBytes)
 }
 
 // Token owner views pending mint requests for their token from customers
@@ -2602,14 +4127,14 @@ func (s *SmartContract) ViewPendingCustomerMintRequests(ctx contractapi.Transact
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "custmintreq_") {
+		if !isMintRequestKey(kv.Key) {
 			continue
 		}
 		var r MintRequest
 		if err := json.Unmarshal(kv.Value, &r); err != nil {
 			continue
 		}
-		if r.Approved {
+		if !isMintRequestPending(r) {
 			continue
 		}
 		if trimmedTokenID != "" && r.TokenID != trimmedTokenID {
@@ -2653,14 +4178,18 @@ func (s *SmartContract) ListApprovedCustomerMintRequests(ctx contractapi.Transac
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "custmintreq_") {
+		if !isMintRequestKey(kv.Key) {
 			continue
 		}
 		var req MintRequest
 		if err := json.Unmarshal(kv.Value, &req); err != nil {
 			continue
 		}
-		if req.Approved {
+		if isMintRequestApproved(req) {
+			// Customer records lane must include only customer-origin mint requests.
+			if !isCustomerScopedMintRequest(req) {
+				continue
+			}
 			// Verify token owner's MSP matches caller's MSP (data isolation)
 			tokenBytes, tErr := ctx.GetStub().GetState(req.TokenID)
 			if tErr != nil || tokenBytes == nil {
@@ -2677,6 +4206,68 @@ func (s *SmartContract) ListApprovedCustomerMintRequests(ctx contractapi.Transac
 		}
 	}
 	return approved, nil
+}
+
+// ListTokenMintRecords returns approved token-owner mint records (admin/bank token mints).
+func (s *SmartContract) ListTokenMintRecords(ctx contractapi.TransactionContextInterface) ([]TokenMintRecord, error) {
+	callerMSP, err := s.GetCallerMSP(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	byRecordID := make(map[string]TokenMintRecord)
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !isTokenMintRecordKey(kv.Key) {
+			continue
+		}
+
+		var rec TokenMintRecord
+		if err := json.Unmarshal(kv.Value, &rec); err != nil {
+			continue
+		}
+		if strings.TrimSpace(rec.TokenID) == "" {
+			continue
+		}
+
+		tokenBytes, tErr := ctx.GetStub().GetState(rec.TokenID)
+		if tErr != nil || tokenBytes == nil {
+			continue
+		}
+		var token Token
+		if err := json.Unmarshal(tokenBytes, &token); err != nil {
+			continue
+		}
+		if token.OwnerMSP != callerMSP {
+			continue
+		}
+
+		recordID := strings.TrimSpace(rec.RecordID)
+		if recordID == "" {
+			recordID = strings.TrimSpace(rec.RequestID)
+		}
+		if recordID == "" {
+			continue
+		}
+		if existing, ok := byRecordID[recordID]; !ok || strings.TrimSpace(rec.ApprovedAt) > strings.TrimSpace(existing.ApprovedAt) {
+			byRecordID[recordID] = rec
+		}
+	}
+
+	records := make([]TokenMintRecord, 0, len(byRecordID))
+	for _, rec := range byRecordID {
+		records = append(records, rec)
+	}
+	return records, nil
 }
 
 // GetApprovedMintRequestsByNetworkAddress returns approved mint requests for a specific customer (by network address)
@@ -2706,15 +4297,15 @@ func (s *SmartContract) GetApprovedMintRequestsByNetworkAddress(ctx contractapi.
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "custmintreq_") {
+		if !isMintRequestKey(kv.Key) {
 			continue
 		}
 		var req MintRequest
 		if err := json.Unmarshal(kv.Value, &req); err != nil {
 			continue
 		}
-		// Filter by customer network address and approval status
-		if req.RequestedBy == customerNetworkAddress && req.Approved {
+		// Filter by customer and approval status
+		if mintRequestCustomerRef(req) == customerNetworkAddress && isMintRequestApproved(req) {
 			approved = append(approved, req)
 		}
 	}
@@ -2741,14 +4332,14 @@ func (s *SmartContract) GetMyApprovedMintRequests(ctx contractapi.TransactionCon
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "custmintreq_") {
+		if !isMintRequestKey(kv.Key) {
 			continue
 		}
 		var req MintRequest
 		if err := json.Unmarshal(kv.Value, &req); err != nil {
 			continue
 		}
-		if req.Approved && req.RequestedBy == callerID {
+		if isMintRequestApproved(req) && mintRequestCustomerRef(req) == callerID {
 			approved = append(approved, req)
 		}
 	}
@@ -2768,7 +4359,11 @@ func (s *SmartContract) ApproveCustomerMint(ctx contractapi.TransactionContextIn
 	}
 
 	// Retrieve the mint request by ID
-	reqBytes, err := ctx.GetStub().GetState(requestID)
+	stateKey, err := s.resolveMintRequestStateKey(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || reqBytes == nil {
 		return fmt.Errorf("mint request not found")
 	}
@@ -2807,13 +4402,13 @@ func (s *SmartContract) ApproveCustomerMint(ctx contractapi.TransactionContextIn
 	}
 
 	// Check if request already approved
-	if mintReq.Approved {
+	if isMintRequestApproved(mintReq) {
 		return fmt.Errorf("mint request already approved")
 	}
 
 	// Check if the token has enough minted coins to fulfill this request
-	if token.Minted < mintReq.Amount {
-		return fmt.Errorf("insufficient minted coin balance on token: available %d, requested %d", token.Minted, mintReq.Amount)
+	if getTokenSupply(token) < int(mintReq.Amount) {
+		return fmt.Errorf("insufficient minted coin balance on token: available %d, requested %d", getTokenSupply(token), mintReq.Amount)
 	}
 
 	// Approve mint request
@@ -2821,18 +4416,21 @@ func (s *SmartContract) ApproveCustomerMint(ctx contractapi.TransactionContextIn
 	if err != nil {
 		return err
 	}
-	mintReq.Approved = true
+	mintReq.Status = "APPROVED"
+	if strings.TrimSpace(mintReq.CreatedAt) == "" {
+		mintReq.CreatedAt = ts
+	}
 	mintReq.ApprovedAt = ts
 	updatedReqBytes, err := json.Marshal(mintReq)
 	if err != nil {
 		return err
 	}
-	if err := ctx.GetStub().PutState(requestID, updatedReqBytes); err != nil {
+	if err := ctx.GetStub().PutState(stateKey, updatedReqBytes); err != nil {
 		return err
 	}
 
 	// Deduct the requested amount from token's minted coins balance
-	token.Minted -= mintReq.Amount
+	setTokenSupply(&token, getTokenSupply(token)-int(mintReq.Amount))
 	updatedTokenBytes, err := json.Marshal(token)
 	if err != nil {
 		return err
@@ -2842,16 +4440,70 @@ func (s *SmartContract) ApproveCustomerMint(ctx contractapi.TransactionContextIn
 	}
 
 	// Credit the customer’s balance
-	cust, customerKey, err := s.getParticipantByNetworkToken(ctx, mintReq.RequestedBy, mintReq.TokenID)
+	cust, customerKey, err := s.getParticipantByCustomerIDToken(ctx, mintRequestCustomerRef(mintReq), mintReq.TokenID)
 	if err != nil {
 		return fmt.Errorf("customer not found")
 	}
-	cust.Balance += mintReq.Amount
+	cust.Balance += int(mintReq.Amount)
 	updatedCustBytes, err := json.Marshal(cust)
 	if err != nil {
 		return err
 	}
 	return ctx.GetStub().PutState(customerKey, updatedCustBytes)
+}
+
+// Token owner rejects customer mint request.
+func (s *SmartContract) RejectCustomerMint(ctx contractapi.TransactionContextInterface, requestID, ownerNetworkAddress string) error {
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return fmt.Errorf("failed to get caller identity: %v", err)
+	}
+	if callerID != ownerNetworkAddress {
+		return fmt.Errorf("forbidden: caller identity does not match owner")
+	}
+
+	stateKey, err := s.resolveMintRequestStateKey(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
+	if err != nil || reqBytes == nil {
+		return fmt.Errorf("mint request not found")
+	}
+	var mintReq MintRequest
+	if err := json.Unmarshal(reqBytes, &mintReq); err != nil {
+		return err
+	}
+
+	if err := s.VerifyBankOwner(ctx, mintReq.TokenID); err != nil {
+		return fmt.Errorf("forbidden: %v", err)
+	}
+
+	tokenBytes, err := ctx.GetStub().GetState(mintReq.TokenID)
+	if err != nil || tokenBytes == nil {
+		return fmt.Errorf("token not found")
+	}
+	var token Token
+	if err := json.Unmarshal(tokenBytes, &token); err != nil {
+		return err
+	}
+	if token.Owner != ownerNetworkAddress {
+		return fmt.Errorf("caller is not token owner")
+	}
+
+	if isMintRequestApproved(mintReq) {
+		return fmt.Errorf("cannot reject an already approved mint request")
+	}
+	if strings.ToUpper(strings.TrimSpace(mintReq.Status)) == "REJECTED" {
+		return fmt.Errorf("mint request already rejected")
+	}
+
+	mintReq.Status = "REJECTED"
+	updatedReqBytes, err := json.Marshal(mintReq)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(stateKey, updatedReqBytes)
 }
 
 // Participant views their subtoken wallet info securely
@@ -2923,6 +4575,10 @@ func (s *SmartContract) ViewCustomerWallet(ctx contractapi.TransactionContextInt
 	return map[string]interface{}{
 		"networkAddress":         cust.NetworkAddress,
 		"customerID":             cust.CustomerID,
+		"customerRef":            cust.CustomerRef,
+		"customer_ref":           cust.CustomerRef,
+		"bic":                    strings.TrimSpace(strings.ToUpper(cust.BIC)),
+		"bic_code":               strings.TrimSpace(strings.ToUpper(cust.BIC)),
 		"tokenID":                cust.TokenID,
 		"balance":                cust.Balance,
 		"currency":               token.Currency,
@@ -2933,6 +4589,11 @@ func (s *SmartContract) ViewCustomerWallet(ctx contractapi.TransactionContextInt
 		"wallet_balance":         walletBalance,
 		"wallet_balance_display": formatCurrencyValue(token.Currency, walletBalance),
 		"approved":               cust.Approved,
+		"status":                 customerApprovalStatus(cust),
+		"last_updated":           strings.TrimSpace(cust.LastUpdated),
+		"approved_at":            strings.TrimSpace(cust.ApprovedAt),
+		"activated_at":           strings.TrimSpace(cust.ActivatedAt),
+		"created_at":             strings.TrimSpace(cust.LastUpdated),
 		"participantTransferIDs": customerParticipantIDs,
 		"tokenTransferIDs":       customerTokenIDs,
 		"participantTransferID":  custPtID,
@@ -2954,7 +4615,27 @@ func (s *SmartContract) GetCustomerIDAccess(ctx contractapi.TransactionContextIn
 
 	customer, _, err := s.getParticipantByNetworkToken(ctx, networkAddress, tokenID)
 	if err != nil {
-		return nil, err
+		pendingReq, pendingErr := s.findPendingCustomerRegistration(ctx, networkAddress, tokenID, callerID)
+		if pendingErr != nil {
+			return nil, pendingErr
+		}
+		if pendingReq != nil {
+			return map[string]interface{}{
+				"network_address": strings.TrimSpace(networkAddress),
+				"token_id":        strings.TrimSpace(tokenID),
+				"customer_id":     "",
+				"approved":        false,
+				"status":          "PENDING_APPROVAL",
+				"message":         "Customer token registration exists and is pending token owner approval",
+			}, nil
+		}
+		return map[string]interface{}{
+			"network_address": strings.TrimSpace(networkAddress),
+			"token_id":        strings.TrimSpace(tokenID),
+			"customer_id":     "",
+			"approved":        false,
+			"status":          "NOT_REGISTERED",
+		}, nil
 	}
 
 	if customer.ClientID != "" && customer.ClientID != callerID {
@@ -2964,13 +4645,343 @@ func (s *SmartContract) GetCustomerIDAccess(ctx contractapi.TransactionContextIn
 		return nil, fmt.Errorf("forbidden: cannot access another bank's customer identity")
 	}
 
+	status := customerApprovalStatus(customer)
 	return map[string]interface{}{
 		"network_address": customer.NetworkAddress,
 		"token_id":        customer.TokenID,
 		"customer_id":     customer.CustomerID,
 		"approved":        customer.Approved,
-		"status":          "approved",
+		"status":          status,
 	}, nil
+}
+
+func customerApprovalStatus(participant *Participant) string {
+	if participant == nil {
+		return "NOT_REGISTERED"
+	}
+	status := strings.TrimSpace(strings.ToUpper(participant.Status))
+	if participant.Approved {
+		if status == "" || status == "PENDING" || status == "ACTIVE" {
+			return "APPROVED"
+		}
+		return status
+	}
+	if status == "" || status == "PENDING" {
+		return "PENDING_APPROVAL"
+	}
+	return status
+}
+
+func customerApprovalResponse(networkAddress, tokenID, customerRef, customerID, bic string, approved bool, status, createdAt, approvedAt, activatedAt string) map[string]interface{} {
+	normalizedStatus := strings.TrimSpace(strings.ToUpper(status))
+	if normalizedStatus == "" {
+		if approved {
+			normalizedStatus = "APPROVED"
+		} else {
+			normalizedStatus = "PENDING_APPROVAL"
+		}
+	}
+	return map[string]interface{}{
+		"network_address": networkAddress,
+		"token_id":        tokenID,
+		"customer_ref":    customerRef,
+		"customer_id":     customerID,
+		"bic":             strings.TrimSpace(strings.ToUpper(bic)),
+		"approved":        approved,
+		"token_assigned":  strings.TrimSpace(tokenID) != "",
+		"status":          normalizedStatus,
+		"created_at":      strings.TrimSpace(createdAt),
+		"approved_at":     strings.TrimSpace(approvedAt),
+		"activated_at":    strings.TrimSpace(activatedAt),
+	}
+}
+
+// GetCustomerTokenApprovalStatus returns whether a customer's token registration is approved.
+// SECURITY: caller can query only their own customer identity.
+func (s *SmartContract) GetCustomerTokenApprovalStatus(ctx contractapi.TransactionContextInterface, networkAddress, tokenID string) (map[string]interface{}, error) {
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get caller identity: %v", err)
+	}
+	callerMSP, err := s.GetCallerMSP(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get caller MSP: %v", err)
+	}
+
+	resolvedNetworkAddress := strings.TrimSpace(networkAddress)
+	if resolvedNetworkAddress == "" {
+		resolvedNetworkAddress = strings.TrimSpace(callerID)
+	}
+	if resolvedNetworkAddress != strings.TrimSpace(callerID) {
+		return nil, fmt.Errorf("forbidden: caller can only query their own token approval status")
+	}
+
+	trimmedTokenID := strings.TrimSpace(tokenID)
+	if trimmedTokenID != "" {
+		customer, _, err := s.getParticipantByNetworkToken(ctx, resolvedNetworkAddress, trimmedTokenID)
+		if err != nil {
+			pendingReq, pendingErr := s.findPendingCustomerRegistration(ctx, resolvedNetworkAddress, trimmedTokenID, callerID)
+			if pendingErr != nil {
+				return nil, pendingErr
+			}
+			if pendingReq != nil {
+				return customerApprovalResponse(
+					resolvedNetworkAddress,
+					trimmedTokenID,
+					pendingReq.CustomerRef,
+					"",
+					pendingReq.BIC,
+					false,
+					"PENDING_APPROVAL",
+					pendingReq.CreatedAt,
+					"",
+					"",
+				), nil
+			}
+			return customerApprovalResponse(resolvedNetworkAddress, trimmedTokenID, "", "", "", false, "NOT_REGISTERED", "", "", ""), nil
+		}
+		normalizeParticipantForRead(customer)
+		if customer.ClientID != "" && strings.TrimSpace(customer.ClientID) != strings.TrimSpace(callerID) {
+			return nil, fmt.Errorf("forbidden: caller identity does not match customer")
+		}
+		if customer.MSP != "" && strings.TrimSpace(customer.MSP) != strings.TrimSpace(callerMSP) {
+			return nil, fmt.Errorf("forbidden: cannot access another bank's customer identity")
+		}
+		status := customerApprovalStatus(customer)
+		return customerApprovalResponse(
+			resolvedNetworkAddress,
+			customer.TokenID,
+			customer.CustomerRef,
+			customer.CustomerID,
+			customer.BIC,
+			customer.Approved,
+			status,
+			customer.LastUpdated,
+			customer.ApprovedAt,
+			customer.ActivatedAt,
+		), nil
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var selected *Participant
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(kv.Key, participantStatePrefix) {
+			continue
+		}
+		var candidate Participant
+		if err := json.Unmarshal(kv.Value, &candidate); err != nil {
+			continue
+		}
+		normalizeParticipantForRead(&candidate)
+
+		matchesCaller := strings.TrimSpace(candidate.ClientID) == strings.TrimSpace(callerID)
+		matchesNetwork := strings.TrimSpace(candidate.NetworkAddress) == resolvedNetworkAddress ||
+			strings.TrimSpace(candidate.CustomerRef) == resolvedNetworkAddress ||
+			strings.TrimSpace(candidate.CustomerID) == resolvedNetworkAddress
+		if !matchesCaller && !matchesNetwork {
+			continue
+		}
+		if candidate.MSP != "" && strings.TrimSpace(candidate.MSP) != strings.TrimSpace(callerMSP) {
+			continue
+		}
+		if selected == nil {
+			copyCandidate := candidate
+			selected = &copyCandidate
+			continue
+		}
+		if !selected.Approved && candidate.Approved {
+			copyCandidate := candidate
+			selected = &copyCandidate
+			continue
+		}
+		if strings.TrimSpace(selected.TokenID) == "" && strings.TrimSpace(candidate.TokenID) != "" {
+			copyCandidate := candidate
+			selected = &copyCandidate
+		}
+	}
+
+	if selected == nil {
+		return customerApprovalResponse(resolvedNetworkAddress, "", "", "", "", false, "NOT_REGISTERED", "", "", ""), nil
+	}
+	status := customerApprovalStatus(selected)
+	return customerApprovalResponse(
+		resolvedNetworkAddress,
+		selected.TokenID,
+		selected.CustomerRef,
+		selected.CustomerID,
+		selected.BIC,
+		selected.Approved,
+		status,
+		selected.LastUpdated,
+		selected.ApprovedAt,
+		selected.ActivatedAt,
+	), nil
+}
+
+// GetMyCustomerAccounts returns the caller's approved/pending customer accounts as simple pairs for dashboard selection.
+// SECURITY: scoped strictly to caller identity and caller MSP.
+func (s *SmartContract) GetMyCustomerAccounts(ctx contractapi.TransactionContextInterface) ([]CustomerTokenAccount, error) {
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get caller identity: %v", err)
+	}
+	callerMSP, err := s.GetCallerMSP(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get caller MSP: %v", err)
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	accounts := make([]CustomerTokenAccount, 0)
+	seen := make(map[string]struct{})
+
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(kv.Key, participantStatePrefix) {
+			continue
+		}
+
+		var candidate Participant
+		if err := json.Unmarshal(kv.Value, &candidate); err != nil {
+			continue
+		}
+		normalizeParticipantForRead(&candidate)
+
+		matchesIdentity := strings.TrimSpace(candidate.ClientID) == strings.TrimSpace(callerID) ||
+			(strings.TrimSpace(candidate.ClientID) == "" && strings.TrimSpace(candidate.NetworkAddress) == strings.TrimSpace(callerID))
+		if !matchesIdentity {
+			continue
+		}
+		if candidate.MSP != "" && strings.TrimSpace(candidate.MSP) != strings.TrimSpace(callerMSP) {
+			continue
+		}
+		if strings.TrimSpace(candidate.TokenID) == "" {
+			continue
+		}
+
+		status := customerApprovalStatus(&candidate)
+		account := CustomerTokenAccount{
+			CustomerRef:    strings.TrimSpace(candidate.CustomerRef),
+			CustomerID:     strings.TrimSpace(candidate.CustomerID),
+			TokenID:        strings.TrimSpace(candidate.TokenID),
+			BIC:            strings.TrimSpace(strings.ToUpper(candidate.BIC)),
+			Approved:       candidate.Approved,
+			Status:         status,
+			NetworkAddress: strings.TrimSpace(candidate.NetworkAddress),
+		}
+		if account.CustomerRef == "" {
+			account.CustomerRef = account.CustomerID
+		}
+		if account.CustomerID == "" {
+			account.CustomerID = account.CustomerRef
+		}
+
+		// Deduplicate customer/token pairs when both legacy and normalized rows exist.
+		dedupeKey := account.CustomerID + "|" + account.TokenID
+		if _, exists := seen[dedupeKey]; exists {
+			continue
+		}
+		seen[dedupeKey] = struct{}{}
+		accounts = append(accounts, account)
+	}
+
+	sort.Slice(accounts, func(i, j int) bool {
+		leftRef := strings.TrimSpace(accounts[i].CustomerRef)
+		rightRef := strings.TrimSpace(accounts[j].CustomerRef)
+		if leftRef == rightRef {
+			return strings.TrimSpace(accounts[i].TokenID) < strings.TrimSpace(accounts[j].TokenID)
+		}
+		return leftRef < rightRef
+	})
+
+	return accounts, nil
+}
+
+// GetCustomerTokenWallet returns full wallet details for a selected account row.
+// SECURITY: caller can only select their own customer_ref/customer_id and token.
+func (s *SmartContract) GetCustomerTokenWallet(ctx contractapi.TransactionContextInterface, customerRef, tokenID string) (map[string]interface{}, error) {
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get caller identity: %v", err)
+	}
+	callerMSP, err := s.GetCallerMSP(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get caller MSP: %v", err)
+	}
+
+	trimmedRef := strings.TrimSpace(customerRef)
+	trimmedTokenID := strings.TrimSpace(tokenID)
+	if trimmedRef == "" || trimmedTokenID == "" {
+		return nil, fmt.Errorf("customer_ref and token_id are required")
+	}
+
+	// Fast path: treat incoming reference as customer_id.
+	customer, _, err := s.getParticipantByCustomerIDToken(ctx, trimmedRef, trimmedTokenID)
+	if err != nil || customer == nil {
+		// Fallback path: scan participant rows and match by customer_ref/network_address/customer_id.
+		iter, scanErr := ctx.GetStub().GetStateByRange("", "")
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		defer iter.Close()
+
+		for iter.HasNext() {
+			kv, nextErr := iter.Next()
+			if nextErr != nil {
+				return nil, nextErr
+			}
+			if !strings.HasPrefix(kv.Key, participantStatePrefix) {
+				continue
+			}
+			var candidate Participant
+			if unmarshalErr := json.Unmarshal(kv.Value, &candidate); unmarshalErr != nil {
+				continue
+			}
+			normalizeParticipantForRead(&candidate)
+			if strings.TrimSpace(candidate.TokenID) != trimmedTokenID {
+				continue
+			}
+			if strings.TrimSpace(candidate.CustomerRef) != trimmedRef &&
+				strings.TrimSpace(candidate.CustomerID) != trimmedRef &&
+				strings.TrimSpace(candidate.NetworkAddress) != trimmedRef {
+				continue
+			}
+			copyCandidate := candidate
+			customer = &copyCandidate
+			break
+		}
+		if customer == nil {
+			return nil, fmt.Errorf("customer account not found for selected customer_ref/token")
+		}
+	}
+
+	if customer.ClientID != "" && strings.TrimSpace(customer.ClientID) != strings.TrimSpace(callerID) {
+		return nil, fmt.Errorf("forbidden: caller identity does not match selected customer account")
+	}
+	if customer.MSP != "" && strings.TrimSpace(customer.MSP) != strings.TrimSpace(callerMSP) {
+		return nil, fmt.Errorf("forbidden: cannot access another bank's customer account")
+	}
+	if strings.TrimSpace(customer.NetworkAddress) == "" {
+		return nil, fmt.Errorf("selected customer account has no network address")
+	}
+
+	return s.ViewCustomerWallet(ctx, customer.NetworkAddress, trimmedTokenID)
 }
 
 // 1. CreateTransferRequest - generates unique ID and submits new transfer request
@@ -3251,8 +5262,7 @@ func (s *SmartContract) ViewTokenHandshakes(ctx contractapi.TransactionContextIn
 
 // Token-to-token transfers ----------------------------------------------------
 
-// CreateTokenTransferRequest lets a sender token owner request a transfer of minted coins to another token.
-func (s *SmartContract) CreateTokenTransferRequest(ctx contractapi.TransactionContextInterface, senderTokenID, receiverTokenID, senderOwnerAddress string, amount int) (string, error) {
+func (s *SmartContract) requestBankTokenTransferInternal(ctx contractapi.TransactionContextInterface, senderTokenID, receiverTokenID, senderOwnerAddress string, amount int64, purpose string) (string, error) {
 	// SECURITY: Verify caller's identity matches the sender owner
 	callerID, err := ctx.GetClientIdentity().GetID()
 	if err != nil {
@@ -3286,7 +5296,7 @@ func (s *SmartContract) CreateTokenTransferRequest(ctx contractapi.TransactionCo
 	if senderToken.Owner != senderOwnerAddress {
 		return "", fmt.Errorf("caller is not the sender token owner")
 	}
-	if senderToken.Minted < amount {
+	if int64(getTokenSupply(senderToken)) < amount {
 		return "", fmt.Errorf("insufficient minted balance on sender token")
 	}
 
@@ -3320,25 +5330,77 @@ func (s *SmartContract) CreateTokenTransferRequest(ctx contractapi.TransactionCo
 	if !hasApprovedHandshake {
 		return "", fmt.Errorf("token-to-token transfer requires an approved handshake between %s and %s. Please initiate and approve a handshake first", senderTokenID, receiverTokenID)
 	}
+	senderBIC, err := s.resolveTokenBIC(ctx, senderToken)
+	if err != nil {
+		return "", err
+	}
+	receiverBIC, err := s.resolveTokenBIC(ctx, receiverToken)
+	if err != nil {
+		return "", err
+	}
+	if !validBICFormat(senderBIC) {
+		return "", fmt.Errorf("sender token BIC is invalid")
+	}
+	if !validBICFormat(receiverBIC) {
+		return "", fmt.Errorf("receiver token BIC is invalid")
+	}
+	if strings.TrimSpace(strings.ToUpper(purpose)) == "" {
+		purpose = transferPurposeInterbankSettlement
+	}
+	purpose = strings.TrimSpace(strings.ToUpper(purpose))
+	if !validBankTransferPurpose(purpose) {
+		return "", fmt.Errorf("purpose must be one of RTGS/NEFT/INTERBANK_SETTLEMENT")
+	}
 
-	reqID := "tokentransfer_" + ctx.GetStub().GetTxID()
+	txTime, err := s.currentTxTime(ctx)
+	if err != nil {
+		return "", err
+	}
+	createdAt, parseErr := time.Parse(time.RFC3339, txTime)
+	if parseErr != nil {
+		createdAt = time.Now().UTC()
+		txTime = createdAt.Format(time.RFC3339)
+	}
+	shortTx := ctx.GetStub().GetTxID()
+	if len(shortTx) > 8 {
+		shortTx = shortTx[:8]
+	}
+	msgID := fmt.Sprintf("%s-%s-%s", senderBIC, receiverBIC, shortTx)
+	stateKey := fmt.Sprintf("%s/TRANSFER/%s", senderBIC, msgID)
 	request := TokenTransferRequest{
-		RequestID:       reqID,
+		MsgID:           msgID,
+		SenderBIC:       senderBIC,
+		ReceiverBIC:     receiverBIC,
 		SenderTokenID:   senderTokenID,
 		ReceiverTokenID: receiverTokenID,
 		Amount:          amount,
 		InitiatedBy:     senderOwnerAddress,
-		Status:          "PendingReceiverApproval",
+		Status:          "PENDING",
 		Currency:        senderCurrency,
+		ExchangeRate:    1.0,
+		Purpose:         purpose,
+		CreatedAt:       txTime,
+		ExpiresAt:       createdAt.Add(transferRequestTTLHours * time.Hour).Format(time.RFC3339),
+		RequestID:       stateKey, // legacy request reference
 	}
 	reqBytes, err := json.Marshal(request)
 	if err != nil {
 		return "", err
 	}
-	if err := ctx.GetStub().PutState(reqID, reqBytes); err != nil {
+	if err := ctx.GetStub().PutState(stateKey, reqBytes); err != nil {
 		return "", err
 	}
-	return reqID, nil
+	return msgID, nil
+}
+
+// CreateTokenTransferRequest keeps backwards-compatible signature and defaults purpose.
+func (s *SmartContract) CreateTokenTransferRequest(ctx contractapi.TransactionContextInterface, senderTokenID, receiverTokenID, senderOwnerAddress string, amount int) (string, error) {
+	return s.requestBankTokenTransferInternal(ctx, senderTokenID, receiverTokenID, senderOwnerAddress, int64(amount), transferPurposeInterbankSettlement)
+}
+
+// RequestBankTransfer allows explicit bank transfer purpose for RTGS/NEFT/INTERBANK settlement.
+func (s *SmartContract) RequestBankTransfer(ctx contractapi.TransactionContextInterface, senderTokenID, receiverTokenID, senderOwnerAddress string, amount int64, purpose string) (string, error) {
+	return s.requestBankTokenTransferInternal(ctx, senderTokenID, receiverTokenID, senderOwnerAddress, amount, purpose)
 }
 
 // ViewPendingTokenTransferRequests allows the receiver token owner to inspect pending transfer requests.
@@ -3381,10 +5443,13 @@ func (s *SmartContract) ViewPendingTokenTransferRequests(ctx contractapi.Transac
 		if err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(kv.Key, "tokentransfer_") {
+		if isTokenTransferRequestKey(kv.Key) {
 			var req TokenTransferRequest
-			if err := json.Unmarshal(kv.Value, &req); err == nil && req.ReceiverTokenID == receiverTokenID && req.Status == "PendingReceiverApproval" {
-				pending = append(pending, req)
+			if err := json.Unmarshal(kv.Value, &req); err == nil {
+				normalizeTokenTransferRequestForRead(&req)
+				if req.ReceiverTokenID == receiverTokenID && req.Status == "PENDING" {
+					pending = append(pending, req)
+				}
 			}
 		}
 	}
@@ -3393,7 +5458,11 @@ func (s *SmartContract) ViewPendingTokenTransferRequests(ctx contractapi.Transac
 
 // ApproveTokenTransferRequest lets the receiver token owner release funds by crediting their token and debiting the sender token.
 func (s *SmartContract) ApproveTokenTransferRequest(ctx contractapi.TransactionContextInterface, requestID, receiverOwnerAddress string) error {
-	reqBytes, err := ctx.GetStub().GetState(requestID)
+	stateKey, err := s.resolveTokenTransferStateKey(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || reqBytes == nil {
 		return fmt.Errorf("token transfer request not found")
 	}
@@ -3401,7 +5470,8 @@ func (s *SmartContract) ApproveTokenTransferRequest(ctx contractapi.TransactionC
 	if err := json.Unmarshal(reqBytes, &request); err != nil {
 		return err
 	}
-	if request.Status != "PendingReceiverApproval" {
+	normalizeTokenTransferRequestForRead(&request)
+	if request.Status != "PENDING" {
 		return fmt.Errorf("transfer request already processed")
 	}
 
@@ -3414,10 +5484,10 @@ func (s *SmartContract) ApproveTokenTransferRequest(ctx contractapi.TransactionC
 	if err := json.Unmarshal(senderBytes, &senderToken); err != nil {
 		return err
 	}
-	if senderToken.Minted < request.Amount {
-		request.Status = "Rejected"
+	if int64(getTokenSupply(senderToken)) < request.Amount {
+		request.Status = "REJECTED"
 		updatedReqBytes, _ := json.Marshal(request)
-		_ = ctx.GetStub().PutState(requestID, updatedReqBytes)
+		_ = ctx.GetStub().PutState(stateKey, updatedReqBytes)
 		return fmt.Errorf("insufficient minted balance on sender token")
 	}
 
@@ -3449,34 +5519,36 @@ func (s *SmartContract) ApproveTokenTransferRequest(ctx contractapi.TransactionC
 		return fmt.Errorf("error verifying handshake: %v", err)
 	}
 	if !hasApprovedHandshake {
-		request.Status = "Rejected"
+		request.Status = "REJECTED"
 		updatedReqBytes, _ := json.Marshal(request)
-		_ = ctx.GetStub().PutState(requestID, updatedReqBytes)
+		_ = ctx.GetStub().PutState(stateKey, updatedReqBytes)
 		return fmt.Errorf("handshake approval was revoked or does not exist between tokens")
 	}
 
 	// Perform transfer
-	senderToken.Minted -= request.Amount
+	transferAmountInt := int(request.Amount)
+	setTokenSupply(&senderToken, getTokenSupply(senderToken)-transferAmountInt)
 	if senderCurrency == receiverCurrency {
-		receiverToken.Minted += request.Amount
+		setTokenSupply(&receiverToken, getTokenSupply(receiverToken)+transferAmountInt)
 	} else {
 		// Foreign currency transfer: add to ForeignBalances (available balance)
 		if receiverToken.ForeignBalances == nil {
 			receiverToken.ForeignBalances = make(map[string]int)
 		}
-		receiverToken.ForeignBalances[senderCurrency] += request.Amount
-		fmt.Printf("[CHAINCODE DEBUG] Added to foreign balances for %s: %d, New total: %d\n", senderCurrency, request.Amount, receiverToken.ForeignBalances[senderCurrency])
+		receiverToken.ForeignBalances[senderCurrency] += transferAmountInt
+		fmt.Printf("[CHAINCODE DEBUG] Added to foreign balances for %s: %d, New total: %d\n", senderCurrency, transferAmountInt, receiverToken.ForeignBalances[senderCurrency])
 	}
 
 	if request.Currency == "" {
 		request.Currency = senderCurrency
 	}
 
-	request.Status = "Completed"
+	request.Status = "SETTLED"
 	ts, err := s.currentTxTime(ctx)
 	if err != nil {
 		return err
 	}
+	request.SettledAt = ts
 	request.CompletedAt = ts
 
 	senderBytes, err = json.Marshal(senderToken)
@@ -3498,27 +5570,51 @@ func (s *SmartContract) ApproveTokenTransferRequest(ctx contractapi.TransactionC
 	if err := ctx.GetStub().PutState(request.ReceiverTokenID, receiverBytes); err != nil {
 		return err
 	}
-	if err := ctx.GetStub().PutState(requestID, reqBytes); err != nil {
+	if err := ctx.GetStub().PutState(stateKey, reqBytes); err != nil {
 		return err
 	}
 
-	recordID := fmt.Sprintf("tokentotransferhistory_%s", ctx.GetStub().GetTxID())
+	txID := ctx.GetStub().GetTxID()
+	shortTx := txID
+	if len(shortTx) > 12 {
+		shortTx = shortTx[:12]
+	}
+	txRef := fmt.Sprintf("TXN-%s-%s", strings.TrimSpace(request.SenderBIC), shortTx)
+	if strings.TrimSpace(request.SenderBIC) == "" {
+		txRef = fmt.Sprintf("TXN-%s", shortTx)
+	}
+	historyKey := fmt.Sprintf("%s/SETTLED/%s", strings.TrimSpace(request.SenderBIC), txRef)
+	if strings.TrimSpace(request.SenderBIC) == "" {
+		historyKey = fmt.Sprintf("SETTLED/%s", txRef)
+	}
 	history := TokenToTokenTransferRecord{
-		RecordID:        recordID,
-		RequestID:       request.RequestID,
+		TxRef:           txRef,
+		MsgID:           strings.TrimSpace(request.MsgID),
+		SenderBIC:       strings.TrimSpace(request.SenderBIC),
+		ReceiverBIC:     strings.TrimSpace(request.ReceiverBIC),
 		SenderTokenID:   request.SenderTokenID,
 		ReceiverTokenID: request.ReceiverTokenID,
 		Amount:          request.Amount,
+		Currency:        request.Currency,
+		ExchangeRate:    request.ExchangeRate,
+		FeeAmount:       0,
+		NetAmount:       request.Amount,
+		Status:          "SETTLED",
+		SettledAt:       ts,
+		BlockHeight:     txID, // TxID used as immutable ledger proof marker.
+		Purpose:         request.Purpose,
+		RecordID:        historyKey, // legacy alias
+		RequestID:       strings.TrimSpace(request.MsgID),
 		InitiatedBy:     request.InitiatedBy,
 		ApprovedBy:      receiverOwnerAddress,
 		ApprovedAt:      ts,
-		Currency:        request.Currency,
 	}
+	normalizeTokenToTokenTransferRecordForRead(&history)
 	historyBytes, err := json.Marshal(history)
 	if err != nil {
 		return err
 	}
-	return ctx.GetStub().PutState(recordID, historyBytes)
+	return ctx.GetStub().PutState(historyKey, historyBytes)
 }
 
 // ListTokenToTokenTransferHistory lists completed token-to-token transfers involving the specified token.
@@ -3549,13 +5645,14 @@ func (s *SmartContract) ListTokenToTokenTransferHistory(ctx contractapi.Transact
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "tokentotransferhistory_") {
+		if !isTokenToTokenTransferHistoryKey(kv.Key) {
 			continue
 		}
 		var record TokenToTokenTransferRecord
 		if err := json.Unmarshal(kv.Value, &record); err != nil {
 			continue
 		}
+		normalizeTokenToTokenTransferRecordForRead(&record)
 		if record.SenderTokenID == tokenID || record.ReceiverTokenID == tokenID {
 			history = append(history, record)
 		}
@@ -3609,15 +5706,16 @@ func (s *SmartContract) ListParticipantTransferHistory(ctx contractapi.Transacti
 		if err := json.Unmarshal(kv.Value, &record); err != nil {
 			continue
 		}
+		normalizeParticipantTransferRecordForRead(&record)
 		if record.SenderParticipantID == networkAddress || record.ReceiverParticipantID == networkAddress {
 			// SWIFT Compliance: Show own customer details, hide counterparty details
 			if record.SenderParticipantID == networkAddress {
-				// This user is the sender - show their customer, hide receiver's
+				// This user is the sender - hide counterparty legacy PII fields.
 				record.ReceiverName = ""
 				record.ReceiverKycId = ""
 				record.ReceiverKycStatus = ""
 			} else {
-				// This user is the receiver - show their customer, hide sender's
+				// This user is the receiver - hide counterparty legacy PII fields.
 				record.SenderName = ""
 				record.SenderKycId = ""
 				record.SenderKycStatus = ""
@@ -3654,9 +5752,127 @@ func (s *SmartContract) ListAllParticipantTransferHistory(ctx contractapi.Transa
 		if err := json.Unmarshal(kv.Value, &record); err != nil {
 			continue
 		}
+		normalizeParticipantTransferRecordForRead(&record)
 		history = append(history, record)
 	}
 	return history, nil
+}
+
+// GetSenderRecords lists immutable participant settlement records for a sender BIC.
+func (s *SmartContract) GetSenderRecords(ctx contractapi.TransactionContextInterface, senderBIC string) ([]ParticipantTransferRecord, error) {
+	if err := s.VerifyAdmin(ctx); err != nil {
+		return nil, fmt.Errorf("forbidden: admin only - %v", err)
+	}
+	senderBIC = strings.TrimSpace(strings.ToUpper(senderBIC))
+	if !validBICFormat(senderBIC) {
+		return nil, fmt.Errorf("sender_bic must be valid BIC8/BIC11")
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var records []ParticipantTransferRecord
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !(strings.Contains(kv.Key, "/RECORDS/") || strings.HasPrefix(kv.Key, "participanttransferhistory_")) {
+			continue
+		}
+		var record ParticipantTransferRecord
+		if err := json.Unmarshal(kv.Value, &record); err != nil {
+			continue
+		}
+		normalizeParticipantTransferRecordForRead(&record)
+		if strings.TrimSpace(strings.ToUpper(record.SenderBIC)) == senderBIC {
+			records = append(records, record)
+		}
+	}
+	return records, nil
+}
+
+// GetReceiverRecords lists immutable participant settlement records for a receiver BIC.
+func (s *SmartContract) GetReceiverRecords(ctx contractapi.TransactionContextInterface, receiverBIC string) ([]ParticipantTransferRecord, error) {
+	if err := s.VerifyAdmin(ctx); err != nil {
+		return nil, fmt.Errorf("forbidden: admin only - %v", err)
+	}
+	receiverBIC = strings.TrimSpace(strings.ToUpper(receiverBIC))
+	if !validBICFormat(receiverBIC) {
+		return nil, fmt.Errorf("receiver_bic must be valid BIC8/BIC11")
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var records []ParticipantTransferRecord
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !(strings.Contains(kv.Key, "/RECORDS/") || strings.HasPrefix(kv.Key, "participanttransferhistory_")) {
+			continue
+		}
+		var record ParticipantTransferRecord
+		if err := json.Unmarshal(kv.Value, &record); err != nil {
+			continue
+		}
+		normalizeParticipantTransferRecordForRead(&record)
+		if strings.TrimSpace(strings.ToUpper(record.ReceiverBIC)) == receiverBIC {
+			records = append(records, record)
+		}
+	}
+	return records, nil
+}
+
+// TotalVolumeByBIC returns summed net settled amount grouped by sender and receiver BIC.
+func (s *SmartContract) TotalVolumeByBIC(ctx contractapi.TransactionContextInterface) (map[string]int64, error) {
+	if err := s.VerifyAdmin(ctx); err != nil {
+		return nil, fmt.Errorf("forbidden: admin only - %v", err)
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	volumes := make(map[string]int64)
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !(strings.Contains(kv.Key, "/RECORDS/") || strings.HasPrefix(kv.Key, "participanttransferhistory_")) {
+			continue
+		}
+		var record ParticipantTransferRecord
+		if err := json.Unmarshal(kv.Value, &record); err != nil {
+			continue
+		}
+		normalizeParticipantTransferRecordForRead(&record)
+		if strings.ToUpper(strings.TrimSpace(record.Status)) != "SETTLED" {
+			continue
+		}
+		net := record.NetAmount
+		if net == 0 {
+			net = record.Amount - record.Commission
+		}
+		if sender := strings.TrimSpace(strings.ToUpper(record.SenderBIC)); sender != "" {
+			volumes[sender] += net
+		}
+		if receiver := strings.TrimSpace(strings.ToUpper(record.ReceiverBIC)); receiver != "" {
+			volumes[receiver] += net
+		}
+	}
+	return volumes, nil
 }
 
 // ListParticipantTransfersByID lets privileged callers fetch participant transfers without credentials.
@@ -3701,6 +5917,7 @@ func (s *SmartContract) ListParticipantTransfersByID(ctx contractapi.Transaction
 		if err := json.Unmarshal(kv.Value, &record); err != nil {
 			continue
 		}
+		normalizeParticipantTransferRecordForRead(&record)
 		if record.SenderParticipantID == participantID || record.ReceiverParticipantID == participantID {
 			history = append(history, record)
 		}
@@ -3710,15 +5927,10 @@ func (s *SmartContract) ListParticipantTransfersByID(ctx contractapi.Transaction
 
 // CUSTOMER-TO-TOKEN TRANSFER FUNCTIONS ========================================
 
-// CreateCustomerToTokenTransferRequest initiates a transfer from a customer through a token to another customer
-// Sender: Customer in Token A (who initiated, certificate verified)
-// Intermediate: Token B (receives funds, takes commission, forwards remainder to receiver customer)
-// Receiver: Customer of Token B (final destination, must be registered with Token B)
-// Status Flow: PendingSenderTokenApproval → PendingReceiverTokenApproval → Completed
-// Checkpoint: receiverCustomerNetworkAddress must be a registered participant of receiverTokenID
-// Commission: Retrieved from blockchain config (configured via SetTokenCommission)
-// SECURITY: Includes currency compatibility check, exchange rate validation, timeout tracking, and escrow protection
-func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.TransactionContextInterface, senderNetworkAddress, senderTokenID, receiverTokenID, receiverCustomerNetworkAddress string, amount int) (string, error) {
+// CreateCustomerToTokenTransferRequest initiates a transfer from a customer to another customer.
+// Input is privacy-safe: sender network address + receiver customer_ref/BIC + amount.
+// Token IDs are resolved internally from approved participant records.
+func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.TransactionContextInterface, senderNetworkAddress, receiverCustomerRef, receiverBIC string, amount int) (string, error) {
 	// SECURITY: Verify caller is the customer (sender)
 	// The network address is set by the backend from the authenticated caller's certificate
 	callerID, err := ctx.GetClientIdentity().GetID()
@@ -3732,6 +5944,39 @@ func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.Tra
 	if amount <= 0 {
 		return "", fmt.Errorf("amount must be positive")
 	}
+	receiverCustomerRef = strings.TrimSpace(receiverCustomerRef)
+	receiverBIC = strings.TrimSpace(strings.ToUpper(receiverBIC))
+	if receiverCustomerRef == "" {
+		return "", fmt.Errorf("receiver_customer_ref is required")
+	}
+	if !validBICFormat(receiverBIC) {
+		return "", fmt.Errorf("receiver_bic must be valid BIC8/BIC11")
+	}
+
+	// Resolve sender/receiver participants first; token IDs come from these records.
+	senderCustomer, senderCustomerKey, err := s.findApprovedCustomerByCaller(ctx, callerID)
+	if err != nil {
+		return "", err
+	}
+	if senderCustomer.NetworkAddress != "" && strings.TrimSpace(senderCustomer.NetworkAddress) != strings.TrimSpace(senderNetworkAddress) {
+		return "", fmt.Errorf("forbidden: caller customer account does not match sender network address")
+	}
+	receiverCustomerByRef, _, err := s.findCustomerByRefAndBIC(ctx, receiverCustomerRef, receiverBIC)
+	if err != nil {
+		return "", err
+	}
+	senderTokenID := strings.TrimSpace(senderCustomer.TokenID)
+	receiverTokenID := strings.TrimSpace(receiverCustomerByRef.TokenID)
+	receiverCustomerNetworkAddress := strings.TrimSpace(receiverCustomerByRef.NetworkAddress)
+	if senderTokenID == "" {
+		return "", fmt.Errorf("sender customer token is not configured")
+	}
+	if receiverTokenID == "" {
+		return "", fmt.Errorf("receiver customer token is not configured")
+	}
+	if receiverCustomerNetworkAddress == "" {
+		return "", fmt.Errorf("receiver customer network address not found")
+	}
 	if senderTokenID == receiverTokenID {
 		return "", fmt.Errorf("cannot transfer to the same token")
 	}
@@ -3742,7 +5987,7 @@ func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.Tra
 		return "", fmt.Errorf("failed to fetch commission config: %v", err)
 	}
 	// Calculate commission amount from percentage
-	commissionAmount := int(float64(amount) * (commissionConfig.CommissionPercentage / 100))
+	commissionAmount := int64(float64(amount) * (commissionConfig.CommissionPercentage / 100))
 
 	// Load and validate sender token
 	senderTokenBytes, err := ctx.GetStub().GetState(senderTokenID)
@@ -3784,8 +6029,8 @@ func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.Tra
 		}
 	}
 
-	// Load sender's participant record to check balance
-	senderCustomer, senderCustomerKey, err := s.getParticipantByNetworkToken(ctx, senderNetworkAddress, senderTokenID)
+	// Load sender's participant record by resolved token/network to check balance.
+	senderCustomer, senderCustomerKey, err = s.getParticipantByNetworkToken(ctx, senderNetworkAddress, senderTokenID)
 	if err != nil {
 		return "", fmt.Errorf("sender customer not registered or approved for sender token")
 	}
@@ -3832,8 +6077,8 @@ func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.Tra
 				if existingTransfer.SenderTokenID == senderTokenID &&
 					existingTransfer.ReceiverTokenID == receiverTokenID &&
 					existingTransfer.ReceiverCustomerID == receiverCustomerNetworkAddress &&
-					existingTransfer.Amount == amount &&
-					(existingTransfer.Status == "PendingSenderTokenApproval" || existingTransfer.Status == "PendingReceiverTokenApproval") {
+					int(existingTransfer.Amount) == amount &&
+					(isCustomerTransferPendingSender(existingTransfer.Status) || isCustomerTransferPendingReceiver(existingTransfer.Status)) {
 					return "", fmt.Errorf("duplicate transfer request: identical transfer already pending")
 				}
 			}
@@ -3850,7 +6095,7 @@ func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.Tra
 	reqID := "custtotoken_" + ctx.GetStub().GetTxID()
 
 	// Commission is passed by application
-	receiverCustomerAmount := amount - commissionAmount
+	receiverCustomerAmount := int64(amount) - commissionAmount
 
 	// IMMEDIATELY DEBIT SENDER CUSTOMER BALANCE (escrow)
 	originalBalance := senderCustomer.Balance
@@ -3871,7 +6116,21 @@ func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.Tra
 	}
 
 	// Create transfer request record
+	senderBIC, err := s.resolveTokenBIC(ctx, senderToken)
+	if err != nil {
+		return "", err
+	}
+	resolvedReceiverBIC, err := s.resolveTokenBIC(ctx, receiverToken)
+	if err != nil {
+		return "", err
+	}
+	msgID := fmt.Sprintf("TXN-%s-%s", senderCustomer.CustomerID, ctx.GetStub().GetTxID()[:8])
 	request := CustomerToTokenTransferRequest{
+		MsgID:                   msgID,
+		SenderCustomerRef:       senderCustomer.CustomerID,
+		SenderBIC:               senderBIC,
+		ReceiverCustomerRef:     receiverCustomer.CustomerID,
+		ReceiverBIC:             resolvedReceiverBIC,
 		TransferRequestID:       reqID,
 		SenderCustomerID:        senderNetworkAddress,
 		SenderCustomerTokenID:   senderCustomer.CustomerID,
@@ -3881,21 +6140,27 @@ func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.Tra
 		ReceiverCustomerID:      receiverCustomerNetworkAddress,
 		ReceiverCustomerTokenID: receiverCustomer.CustomerID,
 		ReceiverCustomerName:    receiverCustomer.Name,
-		Amount:                  amount,
+		Amount:                  int64(amount),
+		Currency:                senderCurrency,
 		SenderCurrency:          senderCurrency,
 		ReceiverCurrency:        receiverCurrency,
-		Status:                  "PendingSenderTokenApproval",
+		Status:                  "PENDING_SENDER",
 		InitiatedBy:             callerID,
 		DebitStatus:             "DEBITED",
 		CreditStatus:            "PENDING",
-		EscrowedAmount:          amount,
+		EscrowAmount:            int64(amount),
+		EscrowedAmount:          int64(amount),
 		ApprovedBySenderOwner:   false,
 		ApprovedByReceiverOwner: false,
-		CommissionPercentage:    float64(commissionAmount) / float64(amount) * 100,
+		CommissionPct:           commissionConfig.CommissionPercentage / 100.0,
+		CommissionPercentage:    commissionConfig.CommissionPercentage,
 		CommissionAmount:        commissionAmount,
+		NetReceiverAmount:       receiverCustomerAmount,
 		ReceiverCustomerAmount:  receiverCustomerAmount,
+		CreatedAt:               time.Unix(txTimestamp.Seconds, int64(txTimestamp.Nanos)).UTC().Format(time.RFC3339),
 		// SECURITY FIX #10: Timeout tracking - record timestamp in SenderTokenOwnerApprovedAt for now (can add CreatedAt field if needed)
 	}
+	normalizeCustomerToTokenTransferRequestForRead(&request)
 
 	reqBytes, err := json.Marshal(request)
 	if err != nil {
@@ -3906,16 +6171,128 @@ func (s *SmartContract) CreateCustomerToTokenTransferRequest(ctx contractapi.Tra
 		return "", err
 	}
 
-	if err := ctx.GetStub().PutState(reqID, reqBytes); err != nil {
+	stateKey := fmt.Sprintf("TRANSFERS/%s/%s", strings.TrimSpace(senderBIC), msgID)
+	if err := ctx.GetStub().PutState(stateKey, reqBytes); err != nil {
 		// SECURITY FIX #11: Reverse debit on state error (improved escrow protection)
 		senderCustomer.Balance = originalBalance
 		senderCustomer.TokenTransferIDs = senderCustomer.TokenTransferIDs[:len(senderCustomer.TokenTransferIDs)-1]
 		_ = ctx.GetStub().PutState(senderCustomerKey, senderCustomerUpdatedBytes)
 		return "", err
 	}
+	// Legacy key for backward compatibility with existing callers.
+	_ = ctx.GetStub().PutState(reqID, reqBytes)
 
-	return reqID, nil
+	return msgID, nil
 
+}
+
+// RequestCustomerTransfer provides a privacy-safe, BIC-based entrypoint for customer transfers.
+// It resolves sender/receiver token IDs internally from customer reference + BIC.
+func (s *SmartContract) RequestCustomerTransfer(ctx contractapi.TransactionContextInterface, receiverCustomerRef, receiverBIC string, amount int64) (string, error) {
+	if amount <= 0 {
+		return "", fmt.Errorf("amount must be positive")
+	}
+	if amount > math.MaxInt32 {
+		return "", fmt.Errorf("amount exceeds supported limit")
+	}
+	receiverBIC = strings.TrimSpace(strings.ToUpper(receiverBIC))
+	if !validBICFormat(receiverBIC) {
+		return "", fmt.Errorf("receiver_bic must be valid BIC8/BIC11")
+	}
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return "", fmt.Errorf("failed to get caller identity: %v", err)
+	}
+
+	return s.CreateCustomerToTokenTransferRequest(
+		ctx,
+		callerID,
+		receiverCustomerRef,
+		receiverBIC,
+		int(amount),
+	)
+}
+
+func (s *SmartContract) storeCustomerTransferRequest(ctx contractapi.TransactionContextInterface, stateKey string, request *CustomerToTokenTransferRequest) error {
+	if request == nil {
+		return fmt.Errorf("transfer request is required")
+	}
+	normalizeCustomerToTokenTransferRequestForRead(request)
+	reqBytes, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	if err := ctx.GetStub().PutState(stateKey, reqBytes); err != nil {
+		return err
+	}
+	// Keep legacy lookup key in sync for compatibility.
+	if request.TransferRequestID != "" && request.TransferRequestID != stateKey {
+		if err := ctx.GetStub().PutState(request.TransferRequestID, reqBytes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SmartContract) rejectCustomerTransferRequest(
+	ctx contractapi.TransactionContextInterface,
+	stateKey string,
+	request *CustomerToTokenTransferRequest,
+	rejectionStatus string,
+	rejectionReason string,
+) error {
+	if request == nil {
+		return fmt.Errorf("transfer request is required")
+	}
+
+	normalizedStatus := normalizeCustomerTransferStatus(rejectionStatus)
+	if !isCustomerTransferRejectedStatus(normalizedStatus) {
+		return fmt.Errorf("invalid rejection status: %s", rejectionStatus)
+	}
+
+	reason := normalizeCustomerTransferRejectionReason(rejectionReason)
+	if reason == "" {
+		reason = "SMART_CONTRACT_ERROR"
+	}
+
+	escrowToReturn := request.EscrowAmount
+	if escrowToReturn == 0 {
+		escrowToReturn = request.EscrowedAmount
+	}
+	if escrowToReturn == 0 {
+		escrowToReturn = request.Amount
+	}
+
+	if escrowToReturn > 0 {
+		senderCustomer, senderCustomerKey, err := s.getParticipantByNetworkToken(ctx, request.SenderCustomerID, request.SenderTokenID)
+		if err != nil {
+			return err
+		}
+		senderCustomer.Balance += int(escrowToReturn)
+		senderUpdatedBytes, err := json.Marshal(senderCustomer)
+		if err != nil {
+			return err
+		}
+		if err := ctx.GetStub().PutState(senderCustomerKey, senderUpdatedBytes); err != nil {
+			return err
+		}
+	}
+
+	ts, err := s.currentTxTime(ctx)
+	if err != nil {
+		return err
+	}
+	request.Status = normalizedStatus
+	request.RejectionReason = reason
+	request.RejectedAt = ts
+	request.CreditStatus = "REVERSED"
+	request.DebitStatus = "REVERSED"
+	request.EscrowAmount = 0
+	request.EscrowedAmount = 0
+	request.NetReceiverAmount = 0
+	request.ReceiverCustomerAmount = 0
+
+	return s.storeCustomerTransferRequest(ctx, stateKey, request)
 }
 
 // ApproveSenderTokenTransfer allows sender token owner to approve or reject the transfer
@@ -3947,7 +6324,7 @@ func (s *SmartContract) ViewPendingCustomerToTokenTransfersAsSender(ctx contract
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "custtotoken_") {
+		if !isCustomerTransferKey(kv.Key) {
 			continue
 		}
 
@@ -3956,9 +6333,9 @@ func (s *SmartContract) ViewPendingCustomerToTokenTransfersAsSender(ctx contract
 			continue
 		}
 
-		// Include transfers where this token is the sender
-		// And status is PendingSenderTokenApproval
-		if req.Status == "PendingSenderTokenApproval" && req.SenderTokenID == tokenID {
+		normalizeCustomerToTokenTransferRequestForRead(&req)
+		// Include transfers where this token is the sender and awaiting sender approval.
+		if isCustomerTransferPendingSender(req.Status) && req.SenderTokenID == tokenID {
 			// Fetch sender customer name
 			senderCustomer, _, err := s.getParticipantByNetworkToken(ctx, req.SenderCustomerID, req.SenderTokenID)
 			if err == nil && senderCustomer != nil {
@@ -4011,7 +6388,7 @@ func (s *SmartContract) ViewPendingCustomerToTokenTransfersAsReceiver(ctx contra
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "custtotoken_") {
+		if !isCustomerTransferKey(kv.Key) {
 			continue
 		}
 
@@ -4020,9 +6397,9 @@ func (s *SmartContract) ViewPendingCustomerToTokenTransfersAsReceiver(ctx contra
 			continue
 		}
 
-		// Include transfers where this token is the receiver
-		// And status is PendingReceiverTokenApproval
-		if req.Status == "PendingReceiverTokenApproval" && req.ReceiverTokenID == tokenID {
+		normalizeCustomerToTokenTransferRequestForRead(&req)
+		// Include transfers where this token is the receiver and awaiting receiver approval.
+		if isCustomerTransferPendingReceiver(req.Status) && req.ReceiverTokenID == tokenID {
 			// Fetch sender customer name
 			senderCustomer, _, err := s.getParticipantByNetworkToken(ctx, req.SenderCustomerID, req.SenderTokenID)
 			if err == nil && senderCustomer != nil {
@@ -4053,7 +6430,11 @@ func (s *SmartContract) GetCustomerToTokenTransferRequestByID(ctx contractapi.Tr
 		return nil, fmt.Errorf("transferRequestID is required")
 	}
 
-	reqBytes, err := ctx.GetStub().GetState(transferRequestID)
+	stateKey, err := s.resolveCustomerTransferStateKey(ctx, transferRequestID)
+	if err != nil {
+		return nil, err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || reqBytes == nil {
 		return nil, fmt.Errorf("transfer request not found")
 	}
@@ -4063,6 +6444,7 @@ func (s *SmartContract) GetCustomerToTokenTransferRequestByID(ctx contractapi.Tr
 		return nil, fmt.Errorf("failed to unmarshal transfer request: %v", err)
 	}
 
+	normalizeCustomerToTokenTransferRequestForRead(&request)
 	return &request, nil
 }
 
@@ -4085,7 +6467,7 @@ func (s *SmartContract) GetCustomerToTokenTransferHistory(ctx contractapi.Transa
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "custtotoken_") {
+		if !isCustomerTransferKey(kv.Key) {
 			continue
 		}
 
@@ -4094,8 +6476,9 @@ func (s *SmartContract) GetCustomerToTokenTransferHistory(ctx contractapi.Transa
 			continue
 		}
 
-		// Include completed transfers involving this token
-		if req.Status == "Completed" && (req.SenderTokenID == tokenID || req.ReceiverTokenID == tokenID) {
+		normalizeCustomerToTokenTransferRequestForRead(&req)
+		// Include settled transfers involving this token.
+		if req.Status == "SETTLED" && (req.SenderTokenID == tokenID || req.ReceiverTokenID == tokenID) {
 			// Fetch sender customer name
 			senderCustomer, _, err := s.getParticipantByNetworkToken(ctx, req.SenderCustomerID, req.SenderTokenID)
 			if err == nil && senderCustomer != nil {
@@ -4120,7 +6503,121 @@ func (s *SmartContract) GetCustomerToTokenTransferHistory(ctx contractapi.Transa
 	return history, nil
 }
 
-// GetCustomerToTokenTransferHistoryByCustomer returns completed customer-to-token transfers for a specific customer
+// GetRejectedByReason returns rejected/failed transfer requests matching a specific rejection reason.
+func (s *SmartContract) GetRejectedByReason(ctx contractapi.TransactionContextInterface, reason string) ([]CustomerToTokenTransferRequest, error) {
+	if err := s.VerifyAdmin(ctx); err != nil {
+		return nil, err
+	}
+	normalizedReason := normalizeCustomerTransferRejectionReason(reason)
+	if normalizedReason == "" {
+		return nil, fmt.Errorf("rejection reason is required")
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	results := []CustomerToTokenTransferRequest{}
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !isCustomerTransferKey(kv.Key) {
+			continue
+		}
+		var req CustomerToTokenTransferRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		normalizeCustomerToTokenTransferRequestForRead(&req)
+		if !isCustomerTransferRejectedStatus(req.Status) {
+			continue
+		}
+		if req.RejectionReason == normalizedReason {
+			results = append(results, req)
+		}
+	}
+	return results, nil
+}
+
+// GetRejectedByBank returns rejected/failed transfer requests for a receiver bank BIC.
+func (s *SmartContract) GetRejectedByBank(ctx contractapi.TransactionContextInterface, receiverBIC string) ([]CustomerToTokenTransferRequest, error) {
+	if err := s.VerifyAdmin(ctx); err != nil {
+		return nil, err
+	}
+	targetBIC := strings.TrimSpace(strings.ToUpper(receiverBIC))
+	if !validBICFormat(targetBIC) {
+		return nil, fmt.Errorf("receiver_bic must be valid BIC8/BIC11")
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	results := []CustomerToTokenTransferRequest{}
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !isCustomerTransferKey(kv.Key) {
+			continue
+		}
+		var req CustomerToTokenTransferRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		normalizeCustomerToTokenTransferRequestForRead(&req)
+		if !isCustomerTransferRejectedStatus(req.Status) {
+			continue
+		}
+		if strings.TrimSpace(strings.ToUpper(req.ReceiverBIC)) == targetBIC {
+			results = append(results, req)
+		}
+	}
+	return results, nil
+}
+
+// GetExpiredEscrowReturns returns transfers auto-returned due to timeout.
+func (s *SmartContract) GetExpiredEscrowReturns(ctx contractapi.TransactionContextInterface) ([]CustomerToTokenTransferRequest, error) {
+	if err := s.VerifyAdmin(ctx); err != nil {
+		return nil, err
+	}
+
+	iter, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	results := []CustomerToTokenTransferRequest{}
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !isCustomerTransferKey(kv.Key) {
+			continue
+		}
+		var req CustomerToTokenTransferRequest
+		if err := json.Unmarshal(kv.Value, &req); err != nil {
+			continue
+		}
+		normalizeCustomerToTokenTransferRequestForRead(&req)
+		if normalizeCustomerTransferStatus(req.Status) == customerTransferStatusExpiredEscrowReturned &&
+			req.RejectionReason == "24HR_TIMEOUT" {
+			results = append(results, req)
+		}
+	}
+	return results, nil
+}
+
+// GetCustomerToTokenTransferHistoryByCustomer returns customer-to-token transfers for a specific customer
 // Shows transfers where customer is either sender or receiver
 // SECURITY FIX #1: Verify caller identity matches the customer requesting history (defense-in-depth)
 // SECURITY FIX #2: Validate customer network address and caller identity at chaincode level
@@ -4166,7 +6663,7 @@ func (s *SmartContract) GetCustomerToTokenTransferHistoryByCustomer(ctx contract
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasPrefix(kv.Key, "custtotoken_") {
+		if !isCustomerTransferKey(kv.Key) {
 			continue
 		}
 
@@ -4175,8 +6672,9 @@ func (s *SmartContract) GetCustomerToTokenTransferHistoryByCustomer(ctx contract
 			continue
 		}
 
-		// Include completed transfers where customer is sender or receiver
-		if req.Status == "Completed" && (req.SenderCustomerID == customerNetworkAddress || req.ReceiverCustomerID == customerNetworkAddress) {
+		normalizeCustomerToTokenTransferRequestForRead(&req)
+		// Include transfers where customer is sender or receiver (including pending approval stages)
+		if req.SenderCustomerID == customerNetworkAddress || req.ReceiverCustomerID == customerNetworkAddress {
 			// SECURITY FIX #6: Set transaction type (DEBIT if sender, CREDIT if receiver)
 			if req.SenderCustomerID == customerNetworkAddress {
 				req.DebitStatus = "DEBITED" // Mark as debit transaction
@@ -4220,8 +6718,12 @@ func (s *SmartContract) ApproveSenderTokenTransfer(ctx contractapi.TransactionCo
 		return fmt.Errorf("forbidden: caller identity does not match sender owner")
 	}
 
+	stateKey, err := s.resolveCustomerTransferStateKey(ctx, transferRequestID)
+	if err != nil {
+		return err
+	}
 	// Load transfer request
-	reqBytes, err := ctx.GetStub().GetState(transferRequestID)
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || reqBytes == nil {
 		return fmt.Errorf("transfer request not found")
 	}
@@ -4229,25 +6731,21 @@ func (s *SmartContract) ApproveSenderTokenTransfer(ctx contractapi.TransactionCo
 	if err := json.Unmarshal(reqBytes, &request); err != nil {
 		return fmt.Errorf("failed to unmarshal transfer request: %v", err)
 	}
+	normalizeCustomerToTokenTransferRequestForRead(&request)
 
 	// Verify transfer is in correct status
-	if request.Status != "PendingSenderTokenApproval" {
+	if !isCustomerTransferPendingSender(request.Status) {
 		return fmt.Errorf("transfer is not pending sender approval. Current status: %s", request.Status)
 	}
 
 	if !approved {
-		// Reject the transfer
-		request.Status = "RejectedBySenderOwner"
-		request.CreditStatus = "REVERSED"
-		// Reverse the debit on sender customer
-		senderCustomer, senderCustomerKey, err := s.getParticipantByNetworkToken(ctx, request.SenderCustomerID, request.SenderTokenID)
-		if err == nil && senderCustomer != nil {
-			senderCustomer.Balance += request.EscrowedAmount
-			updatedBytes, _ := json.Marshal(senderCustomer)
-			_ = ctx.GetStub().PutState(senderCustomerKey, updatedBytes)
-		}
-		updatedReqBytes, _ := json.Marshal(request)
-		return ctx.GetStub().PutState(transferRequestID, updatedReqBytes)
+		return s.rejectCustomerTransferRequest(
+			ctx,
+			stateKey,
+			&request,
+			customerTransferStatusRejectedSenderPreEscrow,
+			"SENDER_KYC_INVALID",
+		)
 	}
 
 	// Verify caller owns the sender token
@@ -4278,14 +6776,54 @@ func (s *SmartContract) ApproveSenderTokenTransfer(ctx contractapi.TransactionCo
 	request.SenderTokenOwnerApprovedAt = ts
 
 	// Move to next stage: pending receiver approval
-	request.Status = "PendingReceiverTokenApproval"
+	request.Status = "PENDING_RECEIVER"
 
 	// Update transfer request
-	updatedReqBytes, err := json.Marshal(request)
+	normalizeCustomerToTokenTransferRequestForRead(&request)
+	return s.storeCustomerTransferRequest(ctx, stateKey, &request)
+}
+
+// RejectSenderPreEscrow allows sender token owner to reject with an explicit reason.
+func (s *SmartContract) RejectSenderPreEscrow(ctx contractapi.TransactionContextInterface, transferRequestID, senderOwnerAddress, reason string) error {
+	callerID, err := ctx.GetClientIdentity().GetID()
 	if err != nil {
-		return fmt.Errorf("failed to marshal transfer request: %v", err)
+		return fmt.Errorf("failed to get caller identity: %v", err)
 	}
-	return ctx.GetStub().PutState(transferRequestID, updatedReqBytes)
+	if callerID != senderOwnerAddress {
+		return fmt.Errorf("forbidden: caller identity does not match sender owner")
+	}
+
+	stateKey, err := s.resolveCustomerTransferStateKey(ctx, transferRequestID)
+	if err != nil {
+		return err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
+	if err != nil || reqBytes == nil {
+		return fmt.Errorf("transfer request not found")
+	}
+
+	var request CustomerToTokenTransferRequest
+	if err := json.Unmarshal(reqBytes, &request); err != nil {
+		return fmt.Errorf("failed to unmarshal transfer request: %v", err)
+	}
+	normalizeCustomerToTokenTransferRequestForRead(&request)
+	if !isCustomerTransferPendingSender(request.Status) {
+		return fmt.Errorf("transfer is not pending sender approval. Current status: %s", request.Status)
+	}
+
+	senderTokenBytes, err := ctx.GetStub().GetState(request.SenderTokenID)
+	if err != nil || senderTokenBytes == nil {
+		return fmt.Errorf("sender token not found")
+	}
+	var senderToken Token
+	if err := json.Unmarshal(senderTokenBytes, &senderToken); err != nil {
+		return fmt.Errorf("failed to unmarshal sender token: %v", err)
+	}
+	if senderToken.Owner != senderOwnerAddress {
+		return fmt.Errorf("caller is not the sender token owner")
+	}
+
+	return s.rejectCustomerTransferRequest(ctx, stateKey, &request, customerTransferStatusRejectedSenderPreEscrow, reason)
 }
 
 // ApproveReceiverTokenTransfer allows receiver token owner to approve and complete customer-to-token transfer
@@ -4304,7 +6842,7 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 
 	// Parse exchange rate and converted amount if provided (for multi-currency transfers)
 	var exchangeRate float64
-	var convertedAmount int
+	var convertedAmount float64
 	if exchangeRateStr != "" {
 		var err error
 		exchangeRate, err = strconv.ParseFloat(exchangeRateStr, 64)
@@ -4314,14 +6852,18 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 	}
 	if convertedAmountStr != "" {
 		var err error
-		convertedAmount, err = strconv.Atoi(convertedAmountStr)
+		convertedAmount, err = strconv.ParseFloat(convertedAmountStr, 64)
 		if err != nil {
 			return fmt.Errorf("invalid converted amount format: %v", err)
 		}
 	}
 
+	stateKey, err := s.resolveCustomerTransferStateKey(ctx, transferRequestID)
+	if err != nil {
+		return err
+	}
 	// Load transfer request
-	reqBytes, err := ctx.GetStub().GetState(transferRequestID)
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
 	if err != nil || reqBytes == nil {
 		return fmt.Errorf("transfer request not found")
 	}
@@ -4329,9 +6871,10 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 	if err := json.Unmarshal(reqBytes, &request); err != nil {
 		return fmt.Errorf("failed to unmarshal transfer request: %v", err)
 	}
+	normalizeCustomerToTokenTransferRequestForRead(&request)
 
 	// Verify transfer is in correct status (sender must have already approved)
-	if request.Status != "PendingReceiverTokenApproval" {
+	if !isCustomerTransferPendingReceiver(request.Status) {
 		return fmt.Errorf("transfer is not pending receiver approval. Current status: %s", request.Status)
 	}
 	if !request.ApprovedBySenderOwner {
@@ -4339,18 +6882,14 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 	}
 
 	if !approved {
-		// Reject the transfer
-		request.Status = "RejectedByReceiverOwner"
-		request.CreditStatus = "REVERSED"
-		// Reverse the debit on sender customer
-		senderCustomer, senderCustomerKey, err := s.getParticipantByNetworkToken(ctx, request.SenderCustomerID, request.SenderTokenID)
-		if err == nil && senderCustomer != nil {
-			senderCustomer.Balance += request.EscrowedAmount
-			updatedBytes, _ := json.Marshal(senderCustomer)
-			_ = ctx.GetStub().PutState(senderCustomerKey, updatedBytes)
-		}
-		updatedReqBytes, _ := json.Marshal(request)
-		return ctx.GetStub().PutState(transferRequestID, updatedReqBytes)
+		request.ApprovedByReceiverOwner = false
+		return s.rejectCustomerTransferRequest(
+			ctx,
+			stateKey,
+			&request,
+			customerTransferStatusRejectedReceiver,
+			"BANK_POLICY_VIOLATION",
+		)
 	}
 
 	// Verify caller owns the receiver token
@@ -4395,9 +6934,9 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 	if senderCurrency == receiverCurrency {
 		// Same currency: both parties get their share in native currency
 		// Receiver token gets commission (2%)
-		receiverToken.Minted += request.CommissionAmount
+		setTokenSupply(&receiverToken, getTokenSupply(receiverToken)+int(request.CommissionAmount))
 		// Receiver customer gets forwarded amount (98%)
-		receiverCustomer.Balance += request.ReceiverCustomerAmount
+		receiverCustomer.Balance += int(request.ReceiverCustomerAmount)
 	} else {
 		// Different currencies: commission deducted from sender amount FIRST, then remaining converted
 		// Example: 3 USD sent
@@ -4410,19 +6949,19 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 		if receiverToken.ForeignBalances == nil {
 			receiverToken.ForeignBalances = make(map[string]int)
 		}
-		receiverToken.ForeignBalances[senderCurrency] += request.EscrowedAmount
+		receiverToken.ForeignBalances[senderCurrency] += int(request.EscrowAmount)
 
 		// 2. Calculate commission from SENDER amount (2%)
 		// Commission in sender currency = 3 USD × 2% = 0.06 USD
-		commissionInSenderCurrency := int(float64(request.EscrowedAmount) * 0.02)
+		commissionInSenderCurrency := int(float64(request.EscrowAmount) * 0.02)
 
 		// 3. Calculate remaining after commission
 		// Remaining = 3 - 0.06 = 2.94 USD
-		remainingAfterCommission := request.EscrowedAmount - commissionInSenderCurrency
+		remainingAfterCommission := int(request.EscrowAmount) - commissionInSenderCurrency
 
 		// 4. Use exchange rate to convert remaining amount
 		// Converted amount = 2.94 USD × 83.5 = 245.49 INR
-		actualConvertedAmount := float64(convertedAmount)
+		actualConvertedAmount := convertedAmount
 		if actualConvertedAmount <= 0 {
 			actualConvertedAmount = request.ConvertedAmount
 		}
@@ -4448,11 +6987,11 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 
 		// 6. Deduct converted customer amount from receiver token's minted balance
 		// to pay the customer
-		receiverToken.Minted -= int(actualConvertedAmount)
+		setTokenSupply(&receiverToken, getTokenSupply(receiverToken)-int(math.Round(actualConvertedAmount)))
 
 		// 7. Credit customer with converted amount
 		// Customer receives = 245.49 INR (no commission deducted from customer's amount)
-		receiverCustomer.Balance += int(actualConvertedAmount)
+		receiverCustomer.Balance += int(math.Round(actualConvertedAmount))
 	}
 
 	ts, err := s.currentTxTime(ctx)
@@ -4461,16 +7000,17 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 	}
 	request.ReceiverTokenOwnerApprovedAt = ts
 	request.CompletedAt = ts
+	request.SettledAt = ts
+	request.RejectedAt = ""
+	request.RejectionReason = ""
 
 	// Mark transfer as completed
-	request.Status = "Completed"
+	request.ApprovedByReceiverOwner = true
+	request.Status = "SETTLED"
 	request.CreditStatus = "CREDITED"
 
 	// Marshal all updates
-	updatedReqBytes, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal transfer request: %v", err)
-	}
+	normalizeCustomerToTokenTransferRequestForRead(&request)
 	updatedReceiverTokenBytes, err := json.Marshal(receiverToken)
 	if err != nil {
 		return fmt.Errorf("failed to marshal receiver token: %v", err)
@@ -4481,7 +7021,7 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 	}
 
 	// Persist all updates
-	if err := ctx.GetStub().PutState(transferRequestID, updatedReqBytes); err != nil {
+	if err := s.storeCustomerTransferRequest(ctx, stateKey, &request); err != nil {
 		return err
 	}
 	if err := ctx.GetStub().PutState(request.ReceiverTokenID, updatedReceiverTokenBytes); err != nil {
@@ -4491,7 +7031,112 @@ func (s *SmartContract) ApproveReceiverTokenTransfer(ctx contractapi.Transaction
 		return err
 	}
 
+	// Append immutable participant settlement record (privacy-safe, BIC/ref-based).
+	txID := ctx.GetStub().GetTxID()
+	shortTx := txID
+	if len(shortTx) > 12 {
+		shortTx = shortTx[:12]
+	}
+	senderBIC := strings.TrimSpace(strings.ToUpper(request.SenderBIC))
+	receiverBIC := strings.TrimSpace(strings.ToUpper(request.ReceiverBIC))
+	txRef := fmt.Sprintf("TXN-%s-%s", senderBIC, shortTx)
+	if senderBIC != "" && receiverBIC != "" {
+		txRef = fmt.Sprintf("TXN-%s-%s-%s", senderBIC, receiverBIC, shortTx)
+	}
+
+	record := ParticipantTransferRecord{
+		TxRef:               txRef,
+		RequestMsgID:        request.MsgID,
+		SenderCustomerRef:   request.SenderCustomerRef,
+		SenderBIC:           senderBIC,
+		ReceiverCustomerRef: request.ReceiverCustomerRef,
+		ReceiverBIC:         receiverBIC,
+		Amount:              request.Amount,
+		Currency:            request.Currency,
+		Commission:          request.CommissionAmount,
+		NetAmount:           request.NetReceiverAmount,
+		ExchangeRate:        request.ExchangeRate,
+		Status:              "SETTLED",
+		SettledAt:           request.SettledAt,
+		BlockHeight:         txID,
+
+		// Legacy aliases for existing consumers.
+		RecordID:              txRef,
+		TransferRequestID:     request.MsgID,
+		TransferID:            request.MsgID,
+		TokenID:               request.SenderTokenID,
+		SenderParticipantID:   request.SenderCustomerRef,
+		ReceiverParticipantID: request.ReceiverCustomerRef,
+		SenderTokenID:         request.SenderTokenID,
+		ReceiverTokenID:       request.ReceiverTokenID,
+		CompletedAt:           request.SettledAt,
+	}
+	normalizeParticipantTransferRecordForRead(&record)
+	recordBytes, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	recordKey := fmt.Sprintf("%s/RECORDS/%s", senderBIC, txRef)
+	if senderBIC == "" {
+		recordKey = fmt.Sprintf("RECORDS/%s", txRef)
+	}
+	if err := ctx.GetStub().PutState(recordKey, recordBytes); err != nil {
+		return err
+	}
+	// Legacy prefix key for existing list APIs.
+	legacyRecordKey := fmt.Sprintf("participanttransferhistory_%s", txRef)
+	if err := ctx.GetStub().PutState(legacyRecordKey, recordBytes); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// RejectReceiver allows receiver token owner to reject with an explicit reason and auto-refund escrow.
+func (s *SmartContract) RejectReceiver(ctx contractapi.TransactionContextInterface, transferRequestID, receiverOwnerAddress, reason string) error {
+	callerID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return fmt.Errorf("failed to get caller identity: %v", err)
+	}
+	if callerID != receiverOwnerAddress {
+		return fmt.Errorf("forbidden: caller identity does not match receiver owner")
+	}
+
+	stateKey, err := s.resolveCustomerTransferStateKey(ctx, transferRequestID)
+	if err != nil {
+		return err
+	}
+	reqBytes, err := ctx.GetStub().GetState(stateKey)
+	if err != nil || reqBytes == nil {
+		return fmt.Errorf("transfer request not found")
+	}
+
+	var request CustomerToTokenTransferRequest
+	if err := json.Unmarshal(reqBytes, &request); err != nil {
+		return fmt.Errorf("failed to unmarshal transfer request: %v", err)
+	}
+	normalizeCustomerToTokenTransferRequestForRead(&request)
+	if !isCustomerTransferPendingReceiver(request.Status) {
+		return fmt.Errorf("transfer is not pending receiver approval. Current status: %s", request.Status)
+	}
+	if !request.ApprovedBySenderOwner {
+		return fmt.Errorf("transfer has not been approved by sender token owner")
+	}
+
+	receiverTokenBytes, err := ctx.GetStub().GetState(request.ReceiverTokenID)
+	if err != nil || receiverTokenBytes == nil {
+		return fmt.Errorf("receiver token not found")
+	}
+	var receiverToken Token
+	if err := json.Unmarshal(receiverTokenBytes, &receiverToken); err != nil {
+		return fmt.Errorf("failed to unmarshal receiver token: %v", err)
+	}
+	if receiverToken.Owner != receiverOwnerAddress {
+		return fmt.Errorf("caller is not the receiver token owner")
+	}
+
+	request.ApprovedByReceiverOwner = false
+	return s.rejectCustomerTransferRequest(ctx, stateKey, &request, customerTransferStatusRejectedReceiver, reason)
 }
 
 // RecordMintTransaction logs a mint transaction in history
